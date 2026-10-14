@@ -307,6 +307,47 @@ void nextpage(void)
 
 /* ---- tiles ------------------------------------------------------------- */
 
+/* PS1: per-level tile groups. The level's tiles are also stored contiguously inside TILEDATA (mkdata.py
+   build_groups) so a level's streaming/preload reads follow one disc area instead of seeking all over the 20 MB
+   of tiles. TILEMAP_<MAP> holds (u16 tile, u16 sector, u16 halfsector) records, sectors relative to TILEDATA;
+   they overwrite tilesect/tileaux, which texcache already reads. TILEIDX is re-read first so the tiles
+   of the previous level's group go back to their global copy. Uses the 64 KB staging buffer (no extra RAM);
+   `map` is the map file name ("E1L1.MAP"), NULL/unknown = global tiles only. */
+static unsigned char group_applied;   /* tilesect/tileaux currently hold a level group's sectors */
+
+void loadpics_group(const char *map)
+{
+	const PakEntry *e = pak_find("TILEIDX");
+	unsigned char *buf = tex_staging();
+	char name[16];
+	long i, t;
+	if (!e) fatal("TILEIDX missing");
+	tex_quiesce();   /* nothing may read into (or use) the staging buffer while it is borrowed */
+	if (group_applied) {   /* (loadpics() just read the global table when no group was applied yet) */
+		if (pak_read(e->sector, (MAXTILES * 16) / 2048, buf) < 0) fatal("TILEIDX read failed");
+		for (t = 0; t < MAXTILES; t++) {
+			const unsigned char *r = buf + t * 16;
+			tilesect[t] = r[8] | (r[9]<<8);
+			tileaux[t] = r[14] | (r[15]<<8);
+		}
+		group_applied = 0;
+	}
+	if (!map) return;
+	memcpy(name, "TILEMAP_", 8);
+	for (i = 0; i < 7 && map[i] && map[i] != '.'; i++) name[8+i] = (map[i] >= 'a' && map[i] <= 'z') ? map[i] - 32 : map[i];
+	name[8+i] = 0;
+	e = pak_find(name);
+	if (!e || e->size > 65536) return;
+	if (pak_read_bytes(e, 0, buf, e->size) < 0) return;
+	group_applied = 1;
+	for (i = 0; i + 6 <= (long)e->size; i += 6) {
+		t = buf[i] | (buf[i+1]<<8);
+		if (t >= MAXTILES) continue;
+		tilesect[t] = buf[i+2] | (buf[i+3]<<8);
+		if (tileflags[t] & 1) tileaux[t] = buf[i+4] | (buf[i+5]<<8);
+	}
+}
+
 long loadpics(char *filename)
 {
 	const PakEntry *e = pak_find("TILEIDX");
@@ -315,6 +356,7 @@ long loadpics(char *filename)
 	if (!e) fatal("TILEIDX missing");
 	if (MAXTILES * 16 > 65536) fatal("TILEIDX larger than the staging buffer");
 	numtiles = MAXTILES;
+	group_applied = 0;
 	if (pak_read(e->sector, (MAXTILES * 16) / 2048, buf) < 0) fatal("TILEIDX read failed");
 	for (k = 0; k < MAXTILES; k += 128) {
 		for (i = 0; i < 128; i++) {

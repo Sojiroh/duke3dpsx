@@ -149,6 +149,14 @@ Menus and screens:
 - `tools/`: build and test tools.
   - `mkdata.py` builds `DUKE.DAT` and `data_index.h` from the GRP (tiles, palettes, maps,
     CON scripts, sounds as SPU-ADPCM, music).
+  - Per-level tile groups: after the global tiles (still the fallback for every tile), `TILEDATA`
+    holds one contiguous copy per map of the tiles that map can ask for (map picnums, their
+    `picanm` animation ranges, the `cachespritenum()` extras, the HUD/weapon tiles; multi-piece
+    tiles excluded), full-res pieces first, then half-res copies. The `TILEMAP_<MAP>` pack entry
+    lists `(u16 tile, u16 sector, u16 halfsector)` records sorted by tile, sectors relative to
+    `TILEDATA`. `loadpics_group()` (engine.c, called from `enterlevel()` and `loadplayer()`) re-reads
+    `TILEIDX` and overlays the records, so streaming and the preload read one disc area per level
+    instead of seeking over the 20 MB of tiles. Costs about 70 MB of disc space (`DUKE.DAT` ~99 MB).
   - `grp.py` reads GRP archives. `spuadpcm.py` encodes SPU-ADPCM. `mkmusic.py` converts music.
   - `emu.py` runs the headless emulator test harness.
   - `viewer/viewer_main.c` is the engine viewer used with `DUKE_VIEWER=ON`.

@@ -60,11 +60,29 @@ target_compile_options(duke3d PRIVATE
 # Watcom treats plain char as unsigned and the Build/Duke sources rely on it; the SDK
 # appends -fsigned-char to target options, so apply ours at source level (comes last).
 set_source_files_properties(${PS1_SRC} ${ENGINE_SRC} ${GAME_SRC} PROPERTIES COMPILE_OPTIONS "-funsigned-char")
+# PS1: the game logic (src/game/*.c) is built with -Os: it is cold code compared to the engine, and -O2
+# inlines the huge game.c/actors.c/player.c/sector.c functions heavily (-64 KB of text / RAM for ~0% frame
+# time).  actors.c (the CON interpreter and actor AI, the hottest game code) keeps the SDK's -O2, as do the
+# engine and platform sources; ps1_control.c / ps1_platform.c always do (tiny).  Override from build.sh:
+# DUKE_GAME_OPT="" restores -O2 everywhere; DUKE_GAME_KEEP lists the game sources (base names) kept at -O2.
+set(DUKE_GAME_OPT "-Os" CACHE STRING "Optimisation flag for src/game/*.c (empty = SDK default, -O2)")
+set(DUKE_GAME_KEEP "actors" CACHE STRING "src/game sources (base names, no .c) kept at the default optimisation level")
+if(DUKE_GAME_OPT)
+	set(GAME_OPT_SRC ${GAME_SRC})
+	foreach(_k ps1_control ps1_platform ${DUKE_GAME_KEEP})
+		list(FILTER GAME_OPT_SRC EXCLUDE REGEX "/${_k}\\.c$")
+	endforeach()
+	set_property(SOURCE ${GAME_OPT_SRC} APPEND PROPERTY COMPILE_OPTIONS ${DUKE_GAME_OPT})
+endif()
 target_compile_definitions(duke3d PRIVATE PS1=1)
 set(EXTRA_CFLAGS "" CACHE STRING "Extra compiler flags (debug switches)")
 if(EXTRA_CFLAGS)
 	separate_arguments(_extra UNIX_COMMAND "${EXTRA_CFLAGS}")
 	target_compile_options(duke3d PRIVATE ${_extra})
+	# PS1: profiling builds hook video_flip() for the stack high-water probe in src/ps1/main.c
+	if("${EXTRA_CFLAGS}" MATCHES "PS1_PROF([= ]|$)" AND NOT DUKE_VIEWER)
+		target_link_options(duke3d PRIVATE -Wl,--wrap=video_flip)
+	endif()
 endif()
 
 psn00bsdk_add_cd_image(

@@ -23,6 +23,7 @@ int tex_resident(int picnum, int request);           /* 1 = all pieces resident 
 int tex_lookup_sync(int picnum, int piece, TexRef *out);  /* like tex_lookup but loads synchronously on a miss */
 void tex_preload(int picnum);
 void tex_preload_range(int first, int last, int lock);  /* single-piece tiles, batched CD reads, optionally locked resident */                         /* synchronous load of all pieces */
+void tex_preload_list(const short *tiles, int n);       /* tiles ordered by tex_sector: resident ones skipped, same-window tiles share one CD read */
 u32 tex_sector(int picnum);                             /* CD sector of the tile (preload ordering) */
 int tex_vram_pct(void);                                /* % of cache VRAM in use */
 void tex_frame(void);                                 /* call once per frame (LRU tick + streaming pump) */

@@ -59,6 +59,7 @@ void cachespritenum(short i)
 #define LS_LVL_TILES    96
 
 extern void tex_flush(void);
+extern void tex_preload_list(const short *tiles, int n);
 extern void tex_preload_range(int first, int last, int lock);
 extern void video_wait_gpu(void);
 extern int tex_vram_pct(void);
@@ -180,16 +181,20 @@ void docacheit(void)
         list[j+1] = k;
     }
 
-    for(i=0;i<n;i++)
+    /* PS1: the list is in disc order and the level group stores the tiles contiguously, so tex_preload_list()
+       reads runs of neighbouring tiles with one CD command; done in chunks to honour the VRAM budget */
+    for(i=0;i<n;)
     {
         if(tex_vram_pct() >= cap) break;
-        loadtile(list[i]);
+        k = n-i < 12 ? n-i : 12;
+        tex_preload_list(list+i,(int)k);
+        i += k;
         /* PS1: loading screen: the preload ends when the list or the VRAM budget runs out, whichever is
            nearer; the bar follows the larger of the two fractions */
-        pct = (int)((i+1)*100/n);
+        pct = (int)(i*100/n);
         k = cap > base ? (tex_vram_pct()-base)*100/(cap-base) : 100;
         loadscreen_progress(k > pct ? k : pct,100);
-        if((i&7) == 7) getpackets();
+        getpackets();
     }
     loadscreen_progress(1,1);
     dbg("docacheit: %ld tiles requested, vram %d%%\n", n, tex_vram_pct());
@@ -197,7 +202,6 @@ void docacheit(void)
     clearbufbyte(gotpic,sizeof(gotpic),0L);
     clearbufbyte(spritetile,sizeof(spritetile),0L);
 }
-
 
 
 void xyzmirror(short i,short wn)
@@ -1199,6 +1203,15 @@ void resetmys(void)
       myreturntocenter = ps[myconnectindex].return_to_center;
 }
 
+extern void loadpics_group(const char *map);
+
+/* PS1: file name of the current level's map for the tile group (NULL for a user map: global tiles only) */
+const char *level_group_map(void)
+{
+    if( boardfilename[0] != 0 && ud.m_level_number == 7 && ud.m_volume_number == 0 ) return NULL;
+    return level_file_names[(ud.volume_number*11)+ud.level_number];
+}
+
 void enterlevel(char g)
 {
     short i,j;
@@ -1266,6 +1279,7 @@ void enterlevel(char g)
     loadscreen_stage(LS_LVL_FONTS,0);
     video_wait_gpu();
     tex_flush();        /* PS1: keeps the locked fonts and loading screen art, so the next line reads nothing */
+    loadpics_group(level_group_map());   /* PS1: the level's tiles stream from one contiguous disc group */
     cachefonts();
 
     loadscreen_stage(LS_LVL_PRELEVEL,0);

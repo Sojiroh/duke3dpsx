@@ -156,6 +156,7 @@ def build_tiles(tiles, pal, halfres=()):
     pieces = []
     recs = bytearray()
     data = bytearray()
+    tilepix = {}  # PS1: single-piece tile -> (full-res pixels, half-res pixels or None), for the level groups
     nearest = nearest_index_table(pal) if halfres else None
     nhalf = 0
 
@@ -186,6 +187,7 @@ def build_tiles(tiles, pal, halfres=()):
             for px in range(0, t.sizx, MAXPIECE):
                 tile_pieces.append(add_piece(n, px, py, img[py : py + MAXPIECE, px : px + MAXPIECE]))
         flags, aux = 0, 0
+        hpix = None
         if len(tile_pieces) > 1:
             aux = len(pieces)
             pieces += tile_pieces
@@ -193,10 +195,116 @@ def build_tiles(tiles, pal, halfres=()):
             hp = add_piece(n, 0, 0, downscale_half(img, pal, nearest))
             flags, aux = 1, hp.sector
             nhalf += 1
+            hpix = hp.pixels
+        if len(tile_pieces) == 1:
+            tilepix[n] = (tile_pieces[0].pixels, hpix)
         recs += struct.pack("<HHiHHHH", t.sizx, t.sizy, t.picanm, tile_pieces[0].sector,
                             avg_color15(img, pal), len(tile_pieces) | (flags << 8), aux)
     print("tiles with a half-resolution copy: %d" % nhalf)
-    return bytes(recs), pieces, bytes(data)
+    return bytes(recs), pieces, data, tilepix
+
+
+def load_names(path):
+    """`#define NAME number` constants of the game's names.h (the group builder mirrors premap.c with them)."""
+    d = {}
+    for line in open(path):
+        m = re.match(r"\s*#define\s+(\w+)\s+(-?\d+)\s*$", line)
+        if m:
+            d[m.group(1)] = int(m.group(2))
+    return d
+
+
+def sprite_extra_tiles(N, pn):
+    """Tiles src/game/premap.c cachespritenum() would request for a sprite of picnum pn, beyond what
+    the generic picnum/animation expansion covers (same table as upstream PREMAP.C cachespritenum)."""
+    ex = set()
+    maxc = 1
+    if pn in (N["HYDRENT"], N["TOILET"], N["STALL"]):
+        ex.add({N["HYDRENT"]: N["BROKEFIREHYDRENT"], N["TOILET"]: N["TOILETBROKE"], N["STALL"]: N["STALLBROKE"]}[pn])
+        ex.update(range(N["TOILETWATER"], N["TOILETWATER"] + 4))
+    elif pn == N["RUBBERCAN"]: maxc = 2
+    elif pn == N["TOILETWATER"]: maxc = 4
+    elif pn == N["FEMPIC1"]: maxc = 44
+    elif pn in tuple(N[k] for k in ("LIZTROOP", "LIZTROOPRUNNING", "LIZTROOPSHOOT", "LIZTROOPJETPACK",
+                                    "LIZTROOPONTOILET", "LIZTROOPDUCKING")):
+        ex.update(range(N["LIZTROOP"], N["LIZTROOP"] + 72))
+        ex.update(range(N["HEADJIB1"], N["LEGJIB1"] + 3))
+        maxc = 0
+    elif pn == N["WOODENHORSE"]:
+        maxc = 5
+        ex.update(range(N["HORSEONSIDE"], N["HORSEONSIDE"] + 4))
+    elif pn in (N["NEWBEAST"], N["NEWBEASTSTAYPUT"]): maxc = 90
+    elif pn in (N["BOSS1"], N["BOSS2"], N["BOSS3"]): maxc = 30
+    elif pn in (N["OCTABRAIN"], N["OCTABRAINSTAYPUT"], N["COMMANDER"], N["COMMANDERSTAYPUT"]): maxc = 38
+    elif pn == N["RECON"]: maxc = 13
+    elif pn in (N["PIGCOP"], N["PIGCOPDIVE"]): maxc = 61
+    elif pn == N["SHARK"]: maxc = 30
+    elif pn in (N["LIZMAN"], N["LIZMANSPITTING"], N["LIZMANFEEDING"], N["LIZMANJUMP"]):
+        ex.update(range(N["LIZMANHEAD1"], N["LIZMANLEG1"] + 3))
+        maxc = 80
+    elif pn == N["APLAYER"]: maxc = 0
+    elif pn == N["ATOMICHEALTH"]: maxc = 14
+    elif pn == N["DRONE"]: maxc = 10
+    elif pn in (N["EXPLODINGBARREL"], N["SEENINE"], N["OOZFILTER"]): maxc = 3
+    elif pn in (N["NUKEBARREL"], N["CAMERA1"]): maxc = 5
+    ex.update(range(pn, pn + maxc))
+    return ex
+
+
+def level_tile_set(board, tiles, N):
+    """Single source of truth for a level's group: every tile the level can ask for (map picnums,
+    their picanm animation ranges, cachespritenum() extras, tiles cachegoodsprites() loads each level)."""
+    base = set()
+    for s in board.sectors:
+        base.add(s[6]); base.add(s[12])
+        if s[6] == N["LA"]: base.update((N["LA"] + 1, N["LA"] + 2))
+        if s[12] == N["LA"]: base.update((N["LA"] + 1, N["LA"] + 2))
+    for w in board.walls:
+        base.add(w[6]); base.add(w[7])
+    ex = set()
+    for sp in board.sprites:
+        base.add(sp[4])
+        ex |= sprite_extra_tiles(N, sp[4])
+    base |= ex
+    base.add(N["BOTTOMSTATUSBAR"])
+    base.update(range(N["STARTALPHANUM"], N["ENDALPHANUM"] + 1))
+    base.update(range(N["FIRSTGUN"], N["FIRSTGUN"] + 3))
+    out = set()
+    for t in base:
+        out.add(t)
+        tl = tiles.get(t)
+        if tl is None:
+            continue
+        frames, typ = tl.picanm & 63, (tl.picanm >> 6) & 3
+        if frames:
+            out.update(range(t - frames, t + 1) if typ == 3 else range(t, t + frames + 1))
+    return out
+
+
+def build_groups(g, tiles, tilepix, data, pack, N):
+    """Append per-level tile groups to the TILEDATA blob `data` (a bytearray) and add a TILEMAP_<MAP> entry
+    for each map: records (u16 tile, u16 sector, u16 halfsector), sorted by tile, sectors relative to TILEDATA
+    (so texcache needs no change). Full-res pieces first (tile order = disc order for the preload), then the
+    half-res copies. Multi-piece tiles stay global. Returns {map: (first sector, sector count)}."""
+    groups = {}
+    for name in g.names(".MAP"):
+        board = G.parse_map(g.read(name))
+        ts = sorted(t for t in level_tile_set(board, tiles, N) if t in tilepix)
+        first = len(data) // SECTOR
+        sect, half = {}, {}
+        for t in ts:
+            sect[t] = len(data) // SECTOR
+            data.extend(tilepix[t][0]); data.extend(b"\0" * (align(len(data)) - len(data)))
+        for t in ts:
+            if tilepix[t][1] is not None:
+                half[t] = len(data) // SECTOR
+                data.extend(tilepix[t][1]); data.extend(b"\0" * (align(len(data)) - len(data)))
+        assert len(data) // SECTOR < 65536, "TILEDATA with groups exceeds u16 sectors"
+        recs = b"".join(struct.pack("<HHH", t, sect[t], half.get(t, 0)) for t in ts)
+        mname = name[:-4]
+        pack.add("TILEMAP_" + mname, recs)
+        groups[mname] = (first, len(data) // SECTOR - first)
+    return groups
 
 
 def write_pals(g):
@@ -357,10 +465,15 @@ def main():
 
     tiles = G.load_all_tiles(g, MAXTILES)
     pal = np.frombuffer(g.read("PALETTE.DAT")[:768], dtype=np.uint8).reshape(256, 3)
-    tileidx, pieces, tiledata = build_tiles(tiles, pal, texture_tiles(g))
+    tileidx, pieces, tiledata, tilepix = build_tiles(tiles, pal, texture_tiles(g))
     pack.add("TILEIDX", tileidx, MAXTILES)
     pack.add("PIECES", b"".join(p.pack() for p in pieces), len(pieces))
+    gsize = len(tiledata)
+    # PS1: the level groups are appended to the TILEDATA blob (their sectors are relative to TILEDATA)
+    N = load_names(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "game", "names.h"))
+    groups = build_groups(g, tiles, tilepix, tiledata, pack, N)
     pack.add("TILEDATA", tiledata)
+    print("tile groups: %d maps, %.1f MB (global TILEDATA %.1f MB)" % (len(groups), (len(tiledata) - gsize) / 1e6, gsize / 1e6))
 
     for name in g.names(".MAP"):
         pack.add(name, g.read(name))
@@ -380,6 +493,8 @@ def main():
         for name, sec, size, aux in table:
             ident = re.sub(r"[^A-Z0-9_]", "_", name)
             h.write("#define DAT_%s_SECTOR %d\n#define DAT_%s_SIZE %d\n" % (ident, sec, ident, size))
+        for mname, (first, n) in sorted(groups.items()):
+            h.write("#define DAT_TILEGRP_%s_SECTOR %d   /* relative to TILEDATA */\n#define DAT_TILEGRP_%s_NSECT %d\n" % (mname, first, mname, n))
     total = os.path.getsize(os.path.join(outdir, "DUKE.DAT"))
     print("DUKE.DAT: %d entries, %d pieces, %.1f MB; shade brightness %s" % (len(table), len(pieces), total / 1e6, bright[:8]))
 

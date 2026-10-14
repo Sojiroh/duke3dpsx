@@ -260,6 +260,7 @@ int loadplayer(signed char spot)
     clearsoundlocks();
     loadscreen_text("ENTERING",level_names[(ud.volume_number*11) + ud.level_number]);
     loadscreen_stage(LS_LOAD_CACHEIT,0);
+    { extern void loadpics_group(const char *map); extern const char *level_group_map(void); loadpics_group(level_group_map()); }   /* PS1 */
     cacheit();
     loadscreen_stage(LS_LOAD_TILES,0);   /* docacheit() reports its own progress */
     docacheit();

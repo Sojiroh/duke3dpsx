@@ -148,8 +148,47 @@ static u8 pendingbit[(MAXTILES + 7) >> 3];
 static u32 staging[65536 / 4];
 void *tex_staging(void) { return staging; }
 static volatile int cd_done;
-static int inflight_slot = -1;
-static int inflight_stride, inflight_h;
+/* async coalesced run in flight (see start_run): slots and their sector offset inside the read */
+#define MAXRUN 64
+#define TEX_WIN 32               /* sectors per run (64 KB staging buffer) */
+#ifndef TEX_READAHEAD
+#define TEX_READAHEAD 1          /* 1 = also load unrequested tiles that lie inside the run's window */
+#endif
+#ifndef TEX_RA_SECS
+#define TEX_RA_SECS 8            /* read-ahead may extend a run up to this many sectors (a window tile in the run's span is free) */
+#endif
+#ifndef TEX_RA_ACTIVE_PCT
+#define TEX_RA_ACTIVE_PCT 50     /* ... only while the recent working set uses less than this % of the cache VRAM (stale tiles are evicted first) */
+#endif
+static s16 run_slot[MAXRUN];
+static u8 run_off[MAXRUN];
+static int nrun, nreq;           /* nrun slots in flight; the first nreq were requested, the rest read-ahead */
+static u32 evict_count;   /* number of LRU evictions: a read-ahead run stops at its first eviction */
+
+#ifdef PS1_PROF
+/* PS1 debug: streaming statistics, reported every 120 frames */
+#define QF(i) qf[(i) & (QLEN - 1)]
+static u16 qf[QLEN];             /* vsync count when each queued tile was requested */
+static u16 run_qf[MAXRUN];
+static u32 prof_cmds, prof_ra, prof_lat, prof_latn, prof_rahit;
+#define prof_cmds_inc() (prof_cmds++)
+static void prof_report(void)
+{
+	static int n, lvs, lloads; static u32 lcmds, lra, llat, llatn, lrahit;
+	int vs, dv, ld;
+	if (++n < 120) return;
+	n = 0; vs = video_vsync_count(); dv = vs - lvs; lvs = vs;
+	if (dv <= 0) dv = 1;
+	ld = tex_stat_loads - lloads; lloads = tex_stat_loads;
+	dbg("PROF stream: window %d vs: pieces %d cmds %d readahead %d latsum %d latn %d meanlat %d vs frametime %d.%02d vs queue %d rahit %d\n",
+		dv, ld, (int)(prof_cmds - lcmds), (int)(prof_ra - lra), (int)(prof_lat - llat), (int)(prof_latn - llatn),
+		(prof_latn - llatn) ? (int)((prof_lat - llat) / (prof_latn - llatn)) : 0,
+		dv / 120, dv * 100 / 120 % 100, (qtail - qhead) & (QLEN - 1), (int)(prof_rahit - lrahit));
+	lcmds = prof_cmds; lra = prof_ra; llat = prof_lat; llatn = prof_latn; lrahit = prof_rahit;
+}
+#else
+#define prof_cmds_inc() ((void)0)
+#endif
 static const PakEntry *tiledata;
 
 /* returns 1 if the half-resolution copy was selected */
@@ -229,6 +268,7 @@ static int evict_lru(void)
 	}
 	if (best < 0) return 0;
 	evict_slot(best);
+	evict_count++;
 	return 1;
 }
 
@@ -299,7 +339,11 @@ static void queue_tile(int picnum)
 {
 	int next = (qtail + 1) & (QLEN - 1);
 	if ((pendingbit[picnum >> 3] & (1 << (picnum & 7))) || next == qhead) return;
-	queue[qtail] = picnum; qtail = next;
+	queue[qtail] = picnum;
+#ifdef PS1_PROF
+	QF(qtail) = (u16)video_vsync_count();
+#endif
+	qtail = next;
 	pendingbit[picnum >> 3] |= 1 << (picnum & 7);
 }
 
@@ -309,10 +353,16 @@ static void queue_tile(int picnum)
 static void queue_tile_prio(int picnum)
 {
 	int n = (qtail - qhead) & (QLEN - 1), i, j;
+#ifdef PS1_PROF
+	u16 qf0 = (u16)video_vsync_count();
+#endif
 	if (pendingbit[picnum >> 3] & (1 << (picnum & 7))) {
 		for (i = 0; i < n; i++) if (queue[(qhead + i) & (QLEN - 1)] == picnum) break;
 		if (i < nprio || i >= n) return;   /* already in the priority zone */
 		j = i;
+#ifdef PS1_PROF
+		qf0 = QF(qhead + i);
+#endif
 	} else {
 		if (n == QLEN - 1) {   /* full: the newest wall/floor request is re-issued by the next frame that needs it */
 			qtail = (qtail - 1) & (QLEN - 1);
@@ -324,26 +374,42 @@ static void queue_tile_prio(int picnum)
 		pendingbit[picnum >> 3] |= 1 << (picnum & 7);
 		j = n;
 	}
-	for (; j > nprio; j--) queue[(qhead + j) & (QLEN - 1)] = queue[(qhead + j - 1) & (QLEN - 1)];
+	for (; j > nprio; j--) {
+		queue[(qhead + j) & (QLEN - 1)] = queue[(qhead + j - 1) & (QLEN - 1)];
+#ifdef PS1_PROF
+		QF(qhead + j) = QF(qhead + j - 1);
+#endif
+	}
 	queue[(qhead + nprio) & (QLEN - 1)] = picnum;
+#ifdef PS1_PROF
+	QF(qhead + nprio) = qf0;
+#endif
 	nprio++;
 }
 
 /* cd_done: 0 = read pending, 1 = staged data valid, -1 = CD error (the staging buffer is not valid) */
 static void cd_cb(int ok) { cd_done = ok ? 1 : -1; }
 
-/* Complete the in-flight async load once its read has finished; returns 1 when nothing is in flight. */
+/* Complete the in-flight async run once its read has finished; returns 1 when nothing is in flight. */
 static int inflight_finish(void)
 {
-	if (inflight_slot < 0) return 1;
+	int i;
+	if (!nrun) return 1;
 	if (!cd_done) return 0;
-	if (cd_done > 0) finish_load(inflight_slot, inflight_stride, inflight_h);
-	else {   /* PS1: failed read: never mark the tile valid; free the slot and request the tile again */
-		int pic = slots[inflight_slot].picnum;
-		evict_slot(inflight_slot);
-		queue_tile(pic);
+	for (i = 0; i < nrun; i++) {
+		int s = run_slot[i];
+		if (cd_done > 0) {
+			finish_load_from(s, piece_stride(slots[s].w), piece_rows(slots[s].h), (const u8 *)staging + run_off[i] * 2048);
+#ifdef PS1_PROF
+			if (i < nreq) { prof_lat += (u16)((u16)video_vsync_count() - run_qf[i]); prof_latn++; }
+#endif
+		} else {   /* PS1: failed read: never mark the tiles valid; free the slots and request the wanted tiles again */
+			int pic = slots[s].picnum;
+			evict_slot(s);
+			if (i < nreq) queue_tile(pic);
+		}
 	}
-	inflight_slot = -1; cd_done = 0;
+	nrun = 0; cd_done = 0;
 	return 1;
 }
 
@@ -376,6 +442,7 @@ void tex_preload_range(int first, int last, int lock)
 			}
 		}
 		if (n == 0) continue;
+		prof_cmds_inc();
 		if (pak_read(tiledata->sector + base, total, staging) < 0) {
 			for (i = 0; i < n; i++) evict_slot(run[i].slot);
 			return;
@@ -384,6 +451,48 @@ void tex_preload_range(int first, int last, int lock)
 			finish_load_from(run[i].slot, run[i].stride, run[i].h, (const u8 *)staging + run[i].off * 2048);
 			if (lock) slots[run[i].slot].lock = 1;
 		}
+	}
+}
+
+/* PS1: preload the tiles of a list (ordered by tex_sector), skipping resident ones, with as few CD reads as
+   possible: tiles that lie completely inside the same 32-sector window (gaps allowed) share one read.
+   Multi-piece tiles are loaded first, one by one (tex_preload). */
+void tex_preload_list(const short *tiles, int n)
+{
+	int t = 0, i;
+	while (!inflight_finish()) ;
+	for (i = 0; i < n; i++) {
+		int pic = tiles[i];
+		if ((unsigned)pic < MAXTILES && tilesizx[pic] > 0 && tilesizy[pic] > 0 && tilenpieces[pic] > 1) tex_preload(pic);
+	}
+	while (t < n) {
+		struct { s16 slot; u8 off; } run[MAXRUN];
+		int cnt = 0, end = 0;
+		u32 base = 0;
+		for (; t < n && cnt < MAXRUN; t++) {
+			int pic = tiles[t], xoff, yoff, w, h, secs, stride, hh, s;
+			u32 sec, dummy;
+			if ((unsigned)pic >= MAXTILES || tilesizx[pic] <= 0 || tilesizy[pic] <= 0 || tilenpieces[pic] > 1) continue;
+			if (find_slot(pic, 0) >= 0) continue;
+			piece_info(pic, 0, &xoff, &yoff, &w, &h, &sec);
+			secs = (piece_stride(w) * piece_rows(h) + 2047) / 2048;
+			if (cnt > 0 && (sec < base || sec + secs > base + TEX_WIN)) break;   /* start a new run */
+			s = begin_load(pic, 0, &stride, &hh, &dummy);
+			if (s < 0) { if (cnt == 0) return; break; }
+			if (cnt == 0) base = dummy;
+			else if (dummy < base || dummy + (stride * hh + 2047) / 2048 > base + TEX_WIN) { evict_slot(s); break; }
+			run[cnt].slot = s; run[cnt].off = dummy - base;
+			if ((int)(dummy - base) + (stride * hh + 2047) / 2048 > end) end = dummy - base + (stride * hh + 2047) / 2048;
+			cnt++;
+		}
+		if (cnt == 0) continue;
+		prof_cmds_inc();
+		if (pak_read(tiledata->sector + base, end, staging) < 0) {
+			for (i = 0; i < cnt; i++) evict_slot(run[i].slot);
+			return;
+		}
+		for (i = 0; i < cnt; i++)
+			finish_load_from(run[i].slot, piece_stride(slots[run[i].slot].w), piece_rows(slots[run[i].slot].h), (const u8 *)staging + run[i].off * 2048);
 	}
 }
 
@@ -396,11 +505,128 @@ void tex_preload(int picnum)
 		if (find_slot(picnum, p) >= 0) continue;
 		s = begin_load(picnum, p, &stride, &h, &sector);
 		if (s < 0) return;
+		prof_cmds_inc();
 		if (pak_read(tiledata->sector + sector, (stride * h + 2047) / 2048, staging) < 0) { evict_slot(s); return; }
 		finish_load(s, stride, h);
 	}
 }
 
+
+/* PS1: coalesced streaming. The head request fixes a window of up to TEX_WIN sectors (the 64 KB staging
+   buffer) on the disc; every other queued single-piece tile that lies completely inside the window is
+   loaded by the same CD command (one seek + one read instead of one per tile). The window start is the
+   piece start that covers the most queued tiles. With TEX_READAHEAD, tiles nobody asked for that also lie
+   in the window are loaded too (as old LRU entries) while the recent working set is small. */
+static void start_run(int picnum, u16 qfh)
+{
+	struct { u32 sec; u16 pic; u8 secs, qi; } c[QLEN];
+	u8 taken[QLEN];
+	int stride, hh, s, n = (qtail - qhead) & (QLEN - 1), k = 0, i, j, cnt, bestcnt;
+	u32 hs, lo;
+	int hsecs, end, minpic = picnum, maxpic = picnum;
+	(void)qfh;
+	s = begin_load(picnum, 0, &stride, &hh, &hs);
+	if (s < 0) return;
+	hsecs = (stride * hh + 2047) / 2048;
+	for (i = 0; i < n; i++) {
+		int p = queue[(qhead + i) & (QLEN - 1)], xo, yo, w, h;
+		u32 sec;
+		taken[i] = 0;
+		if (tilenpieces[p] > 1 || tilesizx[p] <= 0 || tilesizy[p] <= 0 || tile2slot[p] != 0xffff) continue;
+		piece_info(p, 0, &xo, &yo, &w, &h, &sec);
+		if (w <= 0 || h <= 0) continue;
+		c[k].sec = sec; c[k].pic = p; c[k].qi = i;
+		c[k].secs = (piece_stride(w) * piece_rows(h) + 2047) / 2048;
+		k++;
+	}
+	/* window start: head or a lower candidate, whichever includes the most candidates */
+	lo = hs; bestcnt = -1;
+	for (j = -1; j < k; j++) {
+		u32 L = j < 0 ? hs : c[j].sec;
+		if (L > hs || L + TEX_WIN < hs + hsecs) continue;
+		for (cnt = 0, i = 0; i < k; i++) if (c[i].sec >= L && c[i].sec + c[i].secs <= L + TEX_WIN) cnt++;
+		if (cnt > bestcnt) { bestcnt = cnt; lo = L; }
+	}
+	nrun = 1; run_slot[0] = s; run_off[0] = hs - lo; end = hs - lo + hsecs;
+#ifdef PS1_PROF
+	run_qf[0] = qfh;
+#endif
+	for (i = 0; i < k && nrun < MAXRUN; i++) {
+		int st2, h2, s2, secs2;
+		u32 sec2;
+		if (c[i].sec < lo || c[i].sec + c[i].secs > lo + TEX_WIN) continue;
+		s2 = begin_load(c[i].pic, 0, &st2, &h2, &sec2);
+		if (s2 < 0) break;
+		secs2 = (st2 * h2 + 2047) / 2048;
+		if (sec2 < lo || sec2 + secs2 > lo + TEX_WIN) { evict_slot(s2); continue; }   /* half-res choice changed meanwhile */
+		run_slot[nrun] = s2; run_off[nrun] = sec2 - lo;
+		if ((int)(sec2 - lo) + secs2 > end) end = sec2 - lo + secs2;
+#ifdef PS1_PROF
+		run_qf[nrun] = QF(qhead + c[i].qi);
+#endif
+		taken[c[i].qi] = 1;
+		if (c[i].pic < minpic) minpic = c[i].pic;
+		if (c[i].pic > maxpic) maxpic = c[i].pic;
+		nrun++;
+	}
+	nreq = nrun;
+#if TEX_READAHEAD
+	if (tex_active_pct() < TEX_RA_ACTIVE_PCT) {
+		int ra = end > TEX_RA_SECS ? end : TEX_RA_SECS, t, t0 = minpic - 48, t1 = maxpic + 48;
+		u32 ev = evict_count;
+		if (ra > TEX_WIN) ra = TEX_WIN;
+		if (t0 < 0) t0 = 0;
+		if (t1 >= MAXTILES) t1 = MAXTILES - 1;
+		for (t = t0; t <= t1 && nrun < MAXRUN; t++) {
+			int xo, yo, w, h, st2, h2, s2, secs, off;
+			u32 sec, sec2;
+			if (tilesizx[t] <= 0 || tilesizy[t] <= 0 || tilenpieces[t] > 1 || tile2slot[t] != 0xffff) continue;
+			if (piece_info(t, 0, &xo, &yo, &w, &h, &sec) || w <= 0 || h <= 0) continue;
+			secs = (piece_stride(w) * piece_rows(h) + 2047) / 2048;
+			if (sec < lo || (int)(sec - lo) + secs > ra) continue;
+			s2 = begin_load(t, 0, &st2, &h2, &sec2);
+			if (s2 < 0) break;
+			off = sec2 - lo;
+			if (sec2 < lo || off + (st2 * h2 + 2047) / 2048 > TEX_WIN) { evict_slot(s2); continue; }
+			{   /* old LRU entry: evicted first, not part of the working set */
+				Slot *sl = &slots[s2];
+				sl->lastuse = 0;
+				if (!slot_active(sl) && active_frame == texframe) { u32 b = node_texels(sl->node); active_texels = active_texels > b ? active_texels - b : 0; }
+			}
+			run_slot[nrun] = s2; run_off[nrun] = off;
+			if (off + (st2 * h2 + 2047) / 2048 > end) end = off + (st2 * h2 + 2047) / 2048;
+#ifdef PS1_PROF
+			prof_ra++;
+#endif
+			nrun++;
+			if (evict_count != ev) break;   /* the cache is not as empty as assumed */
+		}
+	}
+#endif
+	/* drop the taken (and now resident) requests from the queue */
+	{
+		int w = 0, np = 0;
+		for (i = 0; i < n; i++) {
+			int q = queue[(qhead + i) & (QLEN - 1)];
+			if (taken[i]) { pendingbit[q >> 3] &= ~(1 << (q & 7)); continue; }
+			queue[(qhead + w) & (QLEN - 1)] = q;
+#ifdef PS1_PROF
+			QF(qhead + w) = QF(qhead + i);
+#endif
+			if (i < nprio) np++;
+			w++;
+		}
+		qtail = (qhead + w) & (QLEN - 1); nprio = np;
+	}
+	cd_done = 0;
+#ifdef PS1_PROF
+	prof_cmds++;
+#endif
+	if (!pak_read_async(tiledata->sector + lo, end, staging, cd_cb)) {
+		for (i = 0; i < nrun; i++) evict_slot(run_slot[i]);   /* the tiles are requested again by the next frame that needs them */
+		nrun = 0;
+	}
+}
 
 static void pump(void)
 {
@@ -409,28 +635,31 @@ static void pump(void)
 	while (qhead != qtail) {
 		int picnum = queue[qhead];
 		int p, np;
+#ifdef PS1_PROF
+		u16 qfh = QF(qhead);
+#else
+		u16 qfh = 0;
+#endif
 		qhead = (qhead + 1) & (QLEN - 1);
 		if (nprio) nprio--;
 		pendingbit[picnum >> 3] &= ~(1 << (picnum & 7));
 		np = tilenpieces[picnum] ? tilenpieces[picnum] : 1;
-		for (p = 0; p < np; p++) {
+		if (np == 1) {
+			if (find_slot(picnum, 0) >= 0) continue;
+			start_run(picnum, qfh);
+			return;
+		}
+		for (p = 0; p < np; p++) {   /* multi-piece: load synchronously (rare, menus) */
 			int stride, h, s;
 			u32 sector;
 			if (find_slot(picnum, p) >= 0) continue;
 			s = begin_load(picnum, p, &stride, &h, &sector);
 			if (s < 0) return;
-			if (np > 1) {   /* multi-piece: load synchronously (rare, menus) */
-				if (pak_read(tiledata->sector + sector, (stride * h + 2047) / 2048, staging) < 0) { evict_slot(s); return; }
-				finish_load(s, stride, h);
-				continue;
-			}
-			cd_done = 0;
-			if (!pak_read_async(tiledata->sector + sector, (stride * h + 2047) / 2048, staging, cd_cb)) {
-				evict_slot(s);
-				return;
-			}
-			inflight_slot = s; inflight_stride = stride; inflight_h = h;
-			return;
+#ifdef PS1_PROF
+			prof_cmds++;
+#endif
+			if (pak_read(tiledata->sector + sector, (stride * h + 2047) / 2048, staging) < 0) { evict_slot(s); return; }
+			finish_load(s, stride, h);
 		}
 	}
 }
@@ -442,6 +671,9 @@ int tex_lookup(int picnum, int piece, TexRef *out)
 		Slot *sl = &slots[s];
 		Node *n = &nodes[sl->node];
 		const Page *pg = &pages[n->page];
+#ifdef PS1_PROF
+		if (sl->lastuse == 0) prof_rahit++;   /* a read-ahead tile used for the first time */
+#endif
 		sl->lastuse = texframe;
 		out->tpage = getTPage(1, 0, pg->cellx, pg->celly);
 		out->u = n->x; out->v = n->y;
@@ -500,6 +732,9 @@ void tex_frame(void)
 {
 	pump();        /* before texframe++: slots touched by the frame being submitted stay protected */
 	texframe++;
+#ifdef PS1_PROF
+	prof_report();
+#endif
 }
 
 /* PS1: finish the in-flight streaming read and drop the queued tiles, so that nothing touches the CD or
