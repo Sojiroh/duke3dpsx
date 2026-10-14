@@ -20,6 +20,10 @@ static int hw_inited;
 
 u8 *spu_staging(void) { return (u8 *)staging; }
 
+/* Monotonic 120 Hz clock. The game rewinds totalclock (level start, menu close), which
+   would leave voices "active" for as long as the clock went back. */
+static inline long fx_clock(void) { return (long)video_vsync_count() * 2; }
+
 /* Room reverb preset (psx-spx "SPU Reverb Examples", size 0x26C0 bytes) */
 static const u16 reverb_room[32] = {
 	0x007D, 0x005B, 0x6D80, 0x54B8, 0xBED0, 0x0000, 0x0000, 0xBA80,
@@ -158,7 +162,7 @@ int spu_load_adpcm(u32 sector, u32 bytes, u32 addr, int loop)
 typedef struct {
 	u32 addr, size;     /* size rounded up to 64 */
 	fx_sample *s;       /* NULL = slot unused */
-	u32 last;           /* totalclock of last use */
+	u32 last;           /* fx_clock() of last use */
 } cslot;
 static cslot slots[NSLOTS];
 static int cache_loads, cache_evicts;
@@ -169,7 +173,7 @@ typedef struct {
 	u8 l, r;               /* pan levels 0..255 (audiolib left/right) */
 	u32 serial;
 	u32 cb;
-	long start, end;       /* totalclock */
+	long start, end;       /* fx_clock() */
 	fx_sample *s;
 } fxvoice;
 static fxvoice V[FX_MAXVOICES];
@@ -212,7 +216,7 @@ int FX_LoadSample(fx_sample *s)
 {
 	if (!s || s->magic != FX_SAMPLE_MAGIC) return 0;
 	if (s->slot) {
-		slots[s->slot - 1].last = totalclock;
+		slots[s->slot - 1].last = fx_clock();
 		return 1;
 	}
 	u32 size = (s->size + 63) & ~63u;
@@ -243,7 +247,7 @@ int FX_LoadSample(fx_sample *s)
 	slots[fi].addr = addr;
 	slots[fi].size = size;
 	slots[fi].s = s;
-	slots[fi].last = totalclock;
+	slots[fi].last = fx_clock();
 	s->slot = (u8)(fi + 1);
 	cache_loads++;
 	return 1;
@@ -378,7 +382,7 @@ static int fx_play(fx_sample *s, int pitchoffset, int left, int right, int prior
 	if (idx < 0) return FX_Warning;
 	fxvoice *v = &V[idx];
 	cslot *c = &slots[s->slot - 1];
-	c->last = totalclock;
+	c->last = fx_clock();
 	int ch = SPU_FIRSTFX + idx;
 	u32 pitch = spu_pitch_reg(s->rate, spu_pitch_scale(pitchoffset));
 	if (++fx_serial > 0x3FFFFF) fx_serial = 1;
@@ -391,10 +395,10 @@ static int fx_play(fx_sample *s, int pitchoffset, int left, int right, int prior
 	v->serial = fx_serial;
 	v->cb = cb;
 	v->s = s;
-	v->start = totalclock;
+	v->start = fx_clock();
 	/* length in 120 Hz ticks: samples * 120*4096/(44100*pitch) */
 	u32 nsamples = (s->size / 16 - 1) * 28;
-	v->end = totalclock + (long)((nsamples * 11145u) / (pitch * 1000u)) + 3;
+	v->end = fx_clock() + (long)((nsamples * 11145u) / (pitch * 1000u)) + 3;
 	spu_key_off(1u << ch);
 	apply_volume(idx);
 	SPU_CH_FREQ(ch) = (u16)pitch;
@@ -406,7 +410,7 @@ static int fx_play(fx_sample *s, int pitchoffset, int left, int right, int prior
 		fx_log_left--;
 		dbg("fx: play voice %d (spu ch %d) handle %d spu addr 0x%05x size %u rate %u pitch %04x l/r %d/%d clock %ld\n", idx, ch,
 		    (int)((v->serial << 5) | idx), (unsigned)c->addr, (unsigned)s->size, (unsigned)s->rate, (unsigned)pitch, v->l, v->r,
-		    totalclock);
+		    fx_clock());
 	}
 	return (int)((v->serial << 5) | idx);
 }
@@ -505,7 +509,7 @@ int FX_EndLooping(int handle)
 	if (v->looped) {
 		v->looped = 0;
 		spu_key_off(1u << (SPU_FIRSTFX + (v - V)));
-		v->end = totalclock + 4;
+		v->end = fx_clock() + 4;
 	}
 	return FX_Ok;
 }
@@ -536,7 +540,7 @@ int FX_StopAllSounds(void)
 /* main-thread service: report voices that played to their end */
 void fx_update(void)
 {
-	long now = totalclock;
+	long now = fx_clock();
 	for (int i = 0; i < FX_MAXVOICES; i++) {
 		fxvoice *v = &V[i];
 		if (v->active && !v->looped && now - v->end >= 0) voice_stop(i, 1);

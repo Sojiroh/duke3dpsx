@@ -25,6 +25,7 @@ unsigned mc_scan(void);
 
 /* Free blocks on the card (counting every file, not only ours). */
 int mc_free_blocks(void);
+int mc_file_blocks(int slot, int alt);     /* blocks used by an existing save, 0 if absent */
 
 /* Erase file (slot, alt); 0 or -1. */
 int mc_erase(int slot, int alt);

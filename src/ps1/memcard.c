@@ -192,6 +192,21 @@ int mc_free_blocks(void)
 	return MC_MAX_BLOCKS - used;
 }
 
+/* blocks used by an existing save file (0 if absent) */
+int mc_file_blocks(int slot, int alt)
+{
+	struct DIRENTRY de;
+	char name[32];
+	int n = 0;
+	mc_init();
+	quiesce();
+	hold_irqs();
+	slot_name(name, slot, alt);
+	if (firstfile(name, &de)) n = (de.size + MC_BLOCK - 1) / MC_BLOCK;
+	release_irqs();
+	return n;
+}
+
 int mc_erase(int slot, int alt)
 {
 	char name[32];

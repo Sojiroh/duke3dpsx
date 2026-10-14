@@ -322,9 +322,8 @@ char loadsound(unsigned short num)
     /* PS1: original read the VOC into the cache; here the sample goes to SPU RAM */
     if( sound_register(num) == 0 ) return 0;
 
+    if( FX_LoadSample(&sfxdesc[num]) == 0 ) return 0;   /* PS1: lock only once the sample is resident */
     Sound[num].lock = 200;
-
-    if( FX_LoadSample(&sfxdesc[num]) == 0 ) return 0;
     return 1;
 }
 

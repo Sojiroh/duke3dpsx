@@ -40,9 +40,10 @@ static s16 node_alloc(void)
 static void node_release(s16 n) { nodes[n].child0 = nodefree; nodefree = n; }
 
 static int log2ceil(int v) { int l = 3; while ((1 << l) < v) l++; return l; }
-/* upload geometry matching mkdata.py: stride multiple of 16 texels (min 16), even row count */
+/* upload geometry matching mkdata.py: stride multiple of 16 texels (min 16), rows multiple of 4,
+   so every LoadImage is a multiple of 64 bytes (the SDK's 16-word DMA chunk) */
 static inline int piece_stride(int w) { int s = (w + 15) & ~15; return s < 16 ? 16 : s; }
-static inline int piece_rows(int h) { return h + (h & 1); }
+static inline int piece_rows(int h) { return (h + 3) & ~3; }
 
 /* find a free leaf >= (lw,lh) under node n; split down to exact size; returns node or -1 */
 static s16 node_find(s16 n, int lw, int lh)
@@ -402,8 +403,8 @@ int tex_vram_pct(void) { return (int)(vram_used * 100 / VRAM_TEXELS); }
 /* Must be called once per frame while the GPU is idle (video_wait_gpu() first). */
 void tex_frame(void)
 {
+	pump();        /* before texframe++: slots touched by the frame being submitted stay protected */
 	texframe++;
-	pump();
 }
 
 void tex_flush(void)

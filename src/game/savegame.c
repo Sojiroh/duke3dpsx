@@ -731,7 +731,14 @@ int sg_write(int spot)
     if(cur >= 0)
     {
         if(free_blocks >= nblocks) { safe = 1; target = 1-cur; }
-        else target = cur;           /* no room for a second copy: replace in place */
+        else if(free_blocks + mc_file_blocks(spot,cur) >= nblocks)
+            target = cur;            /* no room for a second copy: replace in place */
+        else
+        {
+            bl_close();
+            sg_error = "MEMORY CARD FULL";   /* keep the old save rather than erase it for nothing */
+            return -1;
+        }
     }
     else
     {

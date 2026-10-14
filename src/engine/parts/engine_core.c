@@ -394,7 +394,7 @@ void drawalls (long bunch)
 			{
 				smostwall[smostwallcnt] = z;
 				smostwalltype[smostwallcnt] = 0;
-				smostwallcnt++;
+				if (smostwallcnt < MAXWALLSB-1) smostwallcnt++;   /* PS1: MAXWALLSB halved; keep the last slot as overflow sink */
 				continue;
 			}
 		}
@@ -513,7 +513,7 @@ void drawalls (long bunch)
 						smoststart[smostwallcnt] = smostcnt;
 						smostwall[smostwallcnt] = z;
 						smostwalltype[smostwallcnt] = 1;   //1 for umost
-						smostwallcnt++;
+						if (smostwallcnt < MAXWALLSB-1) smostwallcnt++;   /* PS1: MAXWALLSB halved; keep the last slot as overflow sink */
 						copybufbyte(&umost[x1],&smost[smostcnt],i*sizeof(smost[0]));
 						smostcnt += i;
 					}
@@ -618,7 +618,7 @@ void drawalls (long bunch)
 						smoststart[smostwallcnt] = smostcnt;
 						smostwall[smostwallcnt] = z;
 						smostwalltype[smostwallcnt] = 2;   //2 for dmost
-						smostwallcnt++;
+						if (smostwallcnt < MAXWALLSB-1) smostwallcnt++;   /* PS1: MAXWALLSB halved; keep the last slot as overflow sink */
 						copybufbyte(&dmost[x1],&smost[smostcnt],i*sizeof(smost[0]));
 						smostcnt += i;
 					}
@@ -643,7 +643,7 @@ void drawalls (long bunch)
 						smostcnt = startsmostcnt;
 						smostwall[smostwallcnt] = z;
 						smostwalltype[smostwallcnt] = 0;
-						smostwallcnt++;
+						if (smostwallcnt < MAXWALLSB-1) smostwallcnt++;   /* PS1: MAXWALLSB halved; keep the last slot as overflow sink */
 					}
 				}
 			}
@@ -686,7 +686,7 @@ void drawalls (long bunch)
 					{ umost[x] = 1; dmost[x] = 0; numhits--; }
 			smostwall[smostwallcnt] = z;
 			smostwalltype[smostwallcnt] = 0;
-			smostwallcnt++;
+			if (smostwallcnt < MAXWALLSB-1) smostwallcnt++;   /* PS1: MAXWALLSB halved; keep the last slot as overflow sink */
 
 			if ((searchit == 2) && (searchx >= x1) && (searchx <= x2))
 			{

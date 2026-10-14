@@ -74,7 +74,7 @@ class TilePiece:
 
     def __init__(self, tile, xoff, yoff, w, h, pixels):
         self.tile, self.xoff, self.yoff, self.w, self.h = tile, xoff, yoff, w, h
-        self.pixels = pixels  # row-major bytes, stride = (w+1)&~1
+        self.pixels = pixels  # row-major bytes, stride multiple of 16, rows multiple of 4
         self.sector = 0
 
     @property
@@ -160,8 +160,11 @@ def build_tiles(tiles, pal, halfres=()):
 
     def add_piece(n, px, py, sub):
         h, w = sub.shape
+        # PSn00bSDK LoadImage DMAs in 16-word (64-byte) chunks, so every upload must be a
+        # multiple of 64 bytes: stride is a multiple of 16 texels (min 16) and the row count a
+        # multiple of 4 (texcache.c piece_stride/piece_rows mirror this).
         stride = max(16, (w + 15) & ~15)
-        rows = h + (h & 1)
+        rows = (h + 3) & ~3
         buf = np.full((rows, stride), 255, dtype=np.uint8)
         buf[:h, :w] = sub
         p = TilePiece(n, px, py, w, h, buf.tobytes())
