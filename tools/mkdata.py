@@ -150,6 +150,7 @@ def build_tiles(tiles, pal, halfres=()):
     """Return (tileidx bytes, pieces list, tiledata bytes).
     TILEREC (16 bytes): u16 sizx, u16 sizy, s32 picanm, u16 sector (piece 0, relative to TILEDATA),
                         u16 avgcolor15, u16 npieces | flags<<8, u16 aux.
+    flags bit 1: sprite-class tile (texcache.c packs it with the shelf allocator instead of a pow2 block).
     flags bit 0: a half-resolution copy exists; aux is then its sector (the runtime loads it instead of
     the full one under VRAM pressure). For multi-piece tiles (any dimension > MAXPIECE) aux is the
     first index into PIECES."""
@@ -159,6 +160,13 @@ def build_tiles(tiles, pal, halfres=()):
     tilepix = {}  # PS1: single-piece tile -> (full-res pixels, half-res pixels or None), for the level groups
     nearest = nearest_index_table(pal) if halfres else None
     nhalf = 0
+    # PS1: flags bit 1 = sprite-class tile (shelf-allocated in VRAM, never repeated as a texture): everything that is
+    # not a wall/floor texture, nor an animation frame of one (frames follow/precede the tile that the map references)
+    wallish = set(halfres)
+    for n in halfres:
+        if n in tiles:
+            fr = tiles[n].picanm & 63
+            wallish.update(range(max(0, n - fr), n + fr + 1))
 
     def add_piece(n, px, py, sub):
         h, w = sub.shape
@@ -198,6 +206,8 @@ def build_tiles(tiles, pal, halfres=()):
             hpix = hp.pixels
         if len(tile_pieces) == 1:
             tilepix[n] = (tile_pieces[0].pixels, hpix)
+            if n not in wallish:
+                flags |= 2   # sprite class: the runtime packs it with the shelf allocator (no texture window / wrapping)
         recs += struct.pack("<HHiHHHH", t.sizx, t.sizy, t.picanm, tile_pieces[0].sector,
                             avg_color15(img, pal), len(tile_pieces) | (flags << 8), aux)
     print("tiles with a half-resolution copy: %d" % nhalf)
@@ -448,6 +458,7 @@ def add_sounds(g, pack):
     nsnd = 0
     worst = (0.0, "")
     biggest = (0, "")
+    blobs = {}
     for name in g.names(".VOC"):
         rate, pcm = voc_to_pcm(g.read(name))
         if len(pcm) == 0:
@@ -477,10 +488,57 @@ def add_sounds(g, pack):
         if len(blob) > biggest[0]:
             biggest = (len(blob), name)
         pack.add(name, blob, rate)
+        blobs[name] = blob
     snr = 10 * np.log10(sq_sig / max(sq_err, 1e-9))
     print("sounds: %d VOC -> SPU-ADPCM, %.2f MB PCM samples -> %.2f MB ADPCM; round-trip RMS err %.1f LSB (SNR %.1f dB, worst %s rel %.2f); largest %s %d KB; looping %d"
           % (nsnd, raw_total / 1e6, adpcm_total / 1e6, np.sqrt(sq_err / max(raw_total, 1)), snr, worst[1], worst[0],
              biggest[1], biggest[0] // 1024, len(looped)))
+    return blobs
+
+
+def add_sound_group(g, pack, blobs):
+    """PS1: level sound preload group.  precachenecessarysounds() preloads sounds in number order until 75% of
+    the SPU sample cache is used (plus a few E1L1 menu sounds), the same set for every map, so one group serves
+    all maps.  SNDGRP = the ADPCM blobs (same bytes as the global copies) back to back, 16-byte aligned, in
+    sound-number order (no per-sound sector padding: the CD time is per sector read); SNDMAP = records (u16
+    soundnum, u16 0, u32 byte offset in SNDGRP, u32 size), aux = record count."""
+    defs = {}
+    for cname in ("DEFS.CON", "GAME.CON", "USER.CON"):
+        if cname in g.entries:
+            for m in re.finditer(r"^\s*define\s+(\w+)\s+(-?\d+)", g.read(cname).decode("latin1"), re.M):
+                defs[m.group(1)] = int(m.group(2))
+    numname = {}
+    for cname in ("USER.CON", "GAME.CON", "DEFS.CON"):
+        if cname not in g.entries:
+            continue
+        for m in re.finditer(r"^\s*definesound\s+(\w+)\s+(\S+)", g.read(cname).decode("latin1"), re.M):
+            if m.group(1) in defs:
+                numname[defs[m.group(1)]] = m.group(2).upper()
+    cache = 0x7D940 - 0x2A000  # spu_priv.h SPU_FX_BASE..SPU_FX_LIMIT
+    special = (17, 99, 189, 232, 233)  # getsound(): always preloaded on E1L1
+    chosen, used = [], 0
+    for num in sorted(numname):
+        if numname[num] not in blobs:
+            continue
+        sz = (len(blobs[numname[num]]) + 63) & ~63
+        if used + sz <= cache // 4 * 3:
+            chosen.append(num)
+            used += sz
+    for num in special:
+        if num in numname and numname[num] in blobs and num not in chosen:
+            chosen.append(num)
+    chosen.sort()
+    assert len(chosen) <= 80, len(chosen)
+    grp = bytearray()
+    recs = bytearray()
+    for num in chosen:
+        blob = blobs[numname[num]]
+        recs += struct.pack("<HHII", num, 0, len(grp), len(blob))
+        assert len(blob) % 16 == 0
+        grp += blob
+    pack.add("SNDGRP", grp)
+    pack.add("SNDMAP", recs, len(chosen))
+    print("sound group: %d sounds, %.0f KB" % (len(chosen), len(grp) / 1024))
 
 
 def add_music(g, pack, sf2=None):
@@ -524,7 +582,7 @@ def main():
     for name in g.names(".ANM"):
         pack.add(name, g.read(name))
     add_music(g, pack, sf2)
-    add_sounds(g, pack)
+    add_sound_group(g, pack, add_sounds(g, pack))
     pack.add("DUKE3D.BIN", g.read("DUKE3D.BIN"))
 
     table = pack.write(os.path.join(outdir, "DUKE.DAT"))

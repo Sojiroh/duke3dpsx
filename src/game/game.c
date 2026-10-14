@@ -101,9 +101,9 @@ static unsigned pf_t2, pf_sub[8];
 #ifdef PS1_PROFJ
 /* spin a random fraction of a vsync at the frame start so that vsync-driven PC sampling is not phase-locked */
 static void pf_jitter(void) { unsigned x = prof_now(), d = (unsigned)(rand() % 262); while(((prof_now()-x)&0xffff) < d); }
-#define PF_MARK() (pf_jitter(), pf_t = prof_now())
+#define PF_MARK() (pf_jitter(), pf_n == 0 ? (void)(pf_v0 = video_vsync_count()) : (void)0, pf_t = prof_now())
 #else
-#define PF_MARK() (pf_t = prof_now())
+#define PF_MARK() (pf_n == 0 ? (void)(pf_v0 = video_vsync_count()) : (void)0, pf_t = prof_now())
 #endif
 #define PF_LAP(k) do { unsigned _n = prof_now(); pf_acc[k] += (_n - pf_t) & 0xffff; pf_t = _n; } while(0)
 static void PF_REPORT(void)
@@ -6418,10 +6418,12 @@ int duke_main(void)
             i = 65536;
 
         PF_LAP(1);
+        rend_2d_async((ps[myconnectindex].gm&MODE_MENU) == 0 && ud.show_help == 0);   /* PS1: in-game overlays never block on CD loads */
         displayrooms(screenpeek,i);
         PF_LAP(2);
         displayrest(i);
         ps1_inframe = 0;
+        rend_2d_async(0);
         PF_LAP(3);
 #ifdef PS1_PROF
         if(video_list_bytes() > pf_maxbytes) pf_maxbytes = video_list_bytes();

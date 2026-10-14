@@ -160,6 +160,7 @@ void initengine(void);
 void uninitengine(void);
 long setgamemode(char davidoption, long daxdim, long daydim);
 void nextpage(void);
+void rend_2d_async(int on);   /* PS1: 1 = rotatesprite() never loads synchronously (in-game overlays); 0 = synchronous (menus, screens) */
 long loadboard(char *filename, long *daposx, long *daposy, long *daposz, short *daang, short *dacursectnum);
 /* horizontal resolution of the 3D column engine = screen width >> REND_XSHIFT (see setview) */
 #ifndef REND_XSHIFT

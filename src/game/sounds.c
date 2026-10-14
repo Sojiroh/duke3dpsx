@@ -307,6 +307,57 @@ static int sound_register(unsigned short num) { return sound_register2(num, 0); 
 #ifdef PS1_PROF
 static int sfx_preloaded;
 #endif
+/* PS1: level sound preload from SNDGRP (the preload set, contiguous on disc; tools/mkdata.py add_sound_group):
+   one coalesced CD read per ~32 KB instead of one seek per sound. Same budget rule as getsound(); sounds not
+   in the group (or when the group is missing) are still handled by getsound() through the global copies. */
+extern void *tex_staging(void);
+extern void tex_quiesce(void);
+void sound_preload_group(void)
+{
+    const PakEntry *gm, *gd;
+    struct { unsigned short num, pad; unsigned int sector, size; } recs[80];
+    fx_sample *list[80];
+    unsigned long rel[80];
+    int i, n = 0, nrec;
+    long planned;
+
+    if (ps1_audio_disabled || SoundToggle == 0 || FXDevice == NumSoundCards) return;
+    gm = pak_find("SNDMAP");
+    gd = pak_find("SNDGRP");
+    if (gm == NULL || gd == NULL) return;
+    nrec = (int)gm->aux;
+    if (nrec > 80 || nrec * (int)sizeof(recs[0]) != (int)gm->size) return;
+    if (pak_read_bytes(gm, 0, recs, gm->size) < 0) return;
+
+    planned = FX_CacheUsed();
+    for (i = 0; i < nrec; i++)
+    {
+        unsigned short num = recs[i].num;
+        long sz;
+        if (num >= NUM_SOUNDS || Sound[num].ptr != 0) continue;
+        if (sound_register2(num, 1) == 0) continue;
+        sz = (sfxdesc[num].size + 63) & ~63;
+        if (sfxdesc[num].size != recs[i].size) continue;
+        if( (ud.level_number == 0 && ud.volume_number == 0 && (num == 189 || num == 232 || num == 99 || num == 233 || num == 17 ) ) ||
+            (planned + sz <= (FX_CacheSize() / 4) * 3) )
+        {
+            planned += sz;
+            Sound[num].lock = 2;
+            list[n] = &sfxdesc[num];
+            rel[n] = recs[i].sector;
+            n++;
+        }
+    }
+    if (n == 0) return;
+    getpackets();
+    tex_quiesce();   /* the 64 KB tile staging buffer is borrowed: no streaming read may use it meanwhile */
+    i = FX_PreloadGroup(list, rel, n, gd->sector, tex_staging(), 65536);
+#ifdef PS1_PROF
+    sfx_preloaded += i;
+    dbg("sound group: %d/%d sounds preloaded\n", i, nrec);
+#endif
+}
+
 char getsound(unsigned short num)
 {
     if(num >= NUM_SOUNDS || SoundToggle == 0) return 0;

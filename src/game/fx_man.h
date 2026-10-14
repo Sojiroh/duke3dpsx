@@ -76,6 +76,10 @@ typedef struct fx_sample
 
 /* Make `s` resident in SPU RAM (loads from CD if needed).  Returns 1 on success. */
 int  FX_LoadSample( fx_sample *s );
+/* PS1: preload samples stored back to back (16-byte aligned) in a group with coalesced CD reads into the caller's
+   `stage` buffer (4-byte aligned, bufbytes); list[i] is at byte offset off[i] (ascending) of the group starting
+   at sector grp_sector.  Returns the number of samples resident. */
+int  FX_PreloadGroup( fx_sample **list, const unsigned long *off, int n, unsigned long grp_sector, void *stage, unsigned long bufbytes );
 /* Bytes of SPU RAM currently used by the sample cache. */
 int  FX_CacheUsed( void );
 /* Total bytes of the SPU RAM sample cache. */

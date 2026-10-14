@@ -96,6 +96,14 @@ static void node_free(s16 n)
 	}
 }
 
+/* ---- shelf allocator state (sprite-class tiles; see alloc_shelf) ---- */
+#define MAXSHELF 48
+typedef struct { u8 y, h4; u16 mask; } Shelf;   /* rows y..y+4*h4; mask bit = used 16-texel column */
+static Shelf shelves[NPAGES][MAXSHELF];
+static u8 nshelf[NPAGES];
+static u8 pclass[NPAGES];      /* page class: 0 unused (empty), 1 buddy tree, 2 shelves; an emptied page is unused again */
+static void shelf_open(int p) { pclass[p] = 2; nshelf[p] = 1; shelves[p][0].y = 0; shelves[p][0].h4 = 64; shelves[p][0].mask = 0; }
+
 /* ---- resident slots ---------------------------------------------------- */
 #define MAXSLOTS 672   /* PS1: was 768 (peak resident tiles seen: ~400); the 96 slots paid for the prefetch code. A full table just evicts the LRU tile */
 typedef struct {
@@ -106,8 +114,10 @@ typedef struct {
 	u8 half;
 	u32 lastuse;
 	u16 w, h, xoff, yoff;
+	u8 page, sx, sy, sh;   /* shelf-class slot (node < 0): page, texel x, row y, shelf height / 4 */
 } Slot;
 static Slot slots[MAXSLOTS];
+static void shelf_free(const Slot *sl);
 static u16 tile2slot[MAXTILES];   /* piece 0 slot or 0xffff */
 static u32 texframe = 1;
 static u32 vram_used;             /* resident block texels */
@@ -125,6 +135,10 @@ int tex_stat_halfloads, tex_stat_oldhalf;   /* cumulative loads: chosen half-res
    begin_load/evict_slot. */
 static u32 active_texels, active_frame;
 static inline u32 node_texels(int n) { return (1u << nodes[n].lw) * (1u << nodes[n].lh); }
+static inline u32 slot_texels(const Slot *sl)
+{
+	return sl->node >= 0 ? node_texels(sl->node) : (u32)piece_stride(sl->w) * (sl->sh * 4);
+}
 static inline int slot_active(const Slot *sl) { return sl->lock || sl->lastuse + PRESSURE_WINDOW >= texframe; }
 static u32 active_texels_now(void)
 {
@@ -132,7 +146,7 @@ static u32 active_texels_now(void)
 		u32 t = 0;
 		int s;
 		for (s = 0; s < MAXSLOTS; s++)
-			if (slots[s].state && slots[s].node >= 0 && slot_active(&slots[s])) t += node_texels(slots[s].node);
+			if (slots[s].state && slot_active(&slots[s])) t += slot_texels(&slots[s]);
 		active_texels = t; active_frame = texframe;
 	}
 	return active_texels;
@@ -199,6 +213,32 @@ static u16 qf[QLEN];             /* vsync count when each queued tile was reques
 static u16 run_qf[MAXRUN];
 static u32 prof_cmds, prof_ra, prof_lat, prof_latn, prof_rahit;
 #define prof_cmds_inc() (prof_cmds++)
+static u32 prof_fail[2];         /* demand begin_load allocation failures (a placeholder is drawn): buddy, shelf */
+static u32 prof_pfref[2];        /* prefetch/read-ahead loads refused for lack of room (nothing was waiting for them) */
+static u32 prof_shelfev, prof_shelflru;   /* shelf-run evictions; allocations that fell back to per-tile LRU */
+#define PROF_FAIL(c) do { if (evict_age > 1) prof_pfref[c]++; else if (prof_fail[c]++ < 6) dbg("PROF alloc fail class %d tile %d %dx%d age %d vram %d%%\n", c, picnum, w, hh, (int)evict_age, tex_vram_pct()); } while (0)
+static int pcount(int c) { int p, n = 0; for (p = 0; p < NPAGES; p++) if (pclass[p] == c) n++; return n; }
+static void prof_shelf_report(const char *tag)
+{
+	u32 nb = 0, rb = 0, ab = 0, ns = 0, rs = 0, as = 0, ps = 0, pd = 0;
+	int s;
+	for (s = 0; s < MAXSLOTS; s++) {
+		const Slot *sl = &slots[s];
+		if (sl->state != 2) continue;
+		if (sl->node >= 0) { nb++; rb += (u32)sl->w * sl->h; ab += slot_texels(sl); }
+		else {
+			ns++; rs += (u32)sl->w * sl->h; as += slot_texels(sl);
+			pd += (u32)piece_stride(sl->w) * piece_rows(sl->h);
+			ps += (1u << log2ceil(piece_stride(sl->w))) * (1u << log2ceil(piece_rows(sl->h)));
+		}
+	}
+	dbg("PROF shelf (%s): buddy tiles %d real %d alloc %d waste %d%% | shelf tiles %d real %d padded %d alloc %d waste %d%% (upload padding alone %d%%; pow2 blocks would waste %d%%) | shelf pages %d%% full, buddy pages %d%% full | alloc fails buddy %d shelf %d (prefetches refused %d) | shelf evictions %d lru-fallbacks %d\n",
+		tag, (int)nb, (int)rb, (int)ab, ab ? (int)((ab - rb) * 100 / ab) : 0,
+		(int)ns, (int)rs, (int)pd, (int)as, as ? (int)((as - rs) * 100 / as) : 0, pd ? (int)((pd - rs) * 100 / pd) : 0,
+		ps ? (int)((ps - rs) * 100 / ps) : 0,
+		(int)(as * 100 / (pcount(2) * 65536 + 1)), (int)(ab * 100 / (pcount(1) * 65536 + 1)), (int)prof_fail[0], (int)prof_fail[1], (int)(prof_pfref[0] + prof_pfref[1]), (int)prof_shelfev, (int)prof_shelflru);
+	dbg("PROF pages: buddy %d shelf %d unused %d\n", pcount(1), pcount(2), pcount(0));
+}
 static void prof_report(void)
 {
 	static int n, lvs, lloads; static u32 lcmds, lra, llat, llatn, lrahit;
@@ -211,10 +251,12 @@ static void prof_report(void)
 		dv, ld, (int)(prof_cmds - lcmds), (int)(prof_ra - lra), (int)(prof_lat - llat), (int)(prof_latn - llatn),
 		(prof_latn - llatn) ? (int)((prof_lat - llat) / (prof_latn - llatn)) : 0,
 		dv / 120, dv * 100 / 120 % 100, (qtail - qhead) & (QLEN - 1), (int)(prof_rahit - lrahit));
+	prof_shelf_report("window");
 	lcmds = prof_cmds; lra = prof_ra; llat = prof_lat; llatn = prof_latn; lrahit = prof_rahit;
 }
 #else
 #define prof_cmds_inc() ((void)0)
+#define PROF_FAIL(c) ((void)0)
 #endif
 static const PakEntry *tiledata;
 
@@ -247,6 +289,7 @@ void tex_init(void)
 		nd->page = i; nd->parent = -1;
 		roots[i] = n;
 	}
+	for (i = 0; i < NPAGES; i++) pclass[i] = 0;
 	for (i = 0; i < MAXSLOTS; i++) slots[i].state = 0;
 	for (i = 0; i < MAXTILES; i++) tile2slot[i] = 0xffff;
 	memset(pendingbit, 0, sizeof(pendingbit));
@@ -275,7 +318,16 @@ static void evict_slot(int s)
 		u32 n = node_texels(sl->node);
 		vram_used -= n;
 		if (active_frame == texframe && slot_active(sl)) active_texels = active_texels > n ? active_texels - n : 0;
-		node_free(sl->node);
+		{
+			int pg = nodes[sl->node].page;
+			node_free(sl->node);
+			if (nodes[roots[pg]].state == 0) pclass[pg] = 0;
+		}
+	} else {
+		u32 n = slot_texels(sl);
+		vram_used -= n;
+		if (active_frame == texframe && slot_active(sl)) active_texels = active_texels > n ? active_texels - n : 0;
+		shelf_free(sl);
 	}
 	if (sl->piece == 0) tile2slot[sl->picnum] = 0xffff;
 	if (sl->half) tex_stat_half--;
@@ -283,13 +335,15 @@ static void evict_slot(int s)
 	tex_stat_resident--;
 }
 
-static int evict_lru(void)
+/* cls: 0 = any slot, 1 = buddy-class slots, 2 = shelf-class slots (the class that has to make room) */
+static int evict_lru(int cls)
 {
 	int s, best = -1;
 	u32 oldest = 0xffffffff;
 	for (s = 0; s < MAXSLOTS; s++) {
 		Slot *sl = &slots[s];
 		if (sl->state != 2 || sl->lock) continue;
+		if (cls && (cls == 2) != (sl->node < 0)) continue;
 		if (sl->lastuse + evict_age > texframe) continue;   /* used within the last evict_age frames (1 = this frame) */
 		if (evict_age > 1 && !sl->lastuse) continue;       /* a prefetch never displaces another unused prefetch/read-ahead tile */
 		if (sl->lastuse < oldest) { oldest = sl->lastuse; best = s; }
@@ -300,15 +354,235 @@ static int evict_lru(void)
 	return 1;
 }
 
+static int slot_page(const Slot *sl) { return sl->node >= 0 ? nodes[sl->node].page : sl->page; }
+
+/* A page of class `cls` (1 buddy, 2 shelf) whose tiles are all unlocked, resident and unused for PRESSURE_WINDOW
+   frames (read-ahead tiles included, unless a prefetch is asking) is emptied so that it can change class.
+   Returns 1 if a page was freed. */
+static int reclaim_stale(int cls)
+{
+	u32 used[NPAGES];
+	u8 bad[NPAGES];
+	int s, p, best = -1;
+	memset(used, 0, sizeof(used)); memset(bad, 0, sizeof(bad));
+	for (s = 0; s < MAXSLOTS; s++) {
+		const Slot *sl = &slots[s];
+		if (!sl->state) continue;
+		p = slot_page(sl);
+		if (sl->state != 2 || sl->lock || sl->lastuse + PRESSURE_WINDOW >= texframe || (evict_age > 1 && !sl->lastuse)) bad[p] = 1;
+		used[p] += slot_texels(sl);
+	}
+	for (p = 0; p < NPAGES; p++)
+		if (pclass[p] == cls && !bad[p] && (best < 0 || used[p] < used[best])) best = p;
+	if (best < 0) return 0;
+	for (s = 0; s < MAXSLOTS; s++)
+		if (slots[s].state && slot_page(&slots[s]) == best) { evict_slot(s); evict_count++; }
+	return 1;
+}
+
 static s16 alloc_block(int w, int h)
 {
 	int lw = log2ceil(piece_stride(w)), lh = log2ceil(piece_rows(h)), i;
 	for (;;) {
 		for (i = 0; i < NPAGES; i++) {
-			s16 n = node_find(roots[i], lw, lh);
+			s16 n;
+			if (pclass[i] != 1) continue;
+			n = node_find(roots[i], lw, lh);
 			if (n >= 0) return n;
 		}
-		if (!evict_lru()) return -1;
+		for (i = 0; i < NPAGES && pclass[i]; i++) ;   /* lowest unused page */
+		if (i < NPAGES) {
+			s16 n = node_find(roots[i], lw, lh);
+			if (n >= 0) { pclass[i] = 1; return n; }
+		}
+		if (reclaim_stale(2)) continue;
+		if (!evict_lru(1)) return -1;
+	}
+}
+
+/* ---- shelf allocator (sprite-class tiles) ------------------------------
+   Pages are assigned to a class on demand and return to "unused" when they empty (pclass[]); a page of the other class
+   whose tiles have all gone stale is reclaimed when a class runs out of room. Pages are cut into horizontal shelves; every page is a contiguous list of shelves
+   (y order, covering all 256 rows). A free shelf (mask 0) takes the height class (shelf_hclass) of the first sprite placed
+   in it (split off from the free shelf, next to a shelf of the same class when possible), a used shelf holds 16-texel
+   columns (one mask bit per column) for sprites of its height class. Freeing the last sprite of a shelf merges it with
+   free neighbours. When nothing fits, shelf_evict() empties the run of adjacent shelves with the oldest latest use. */
+static int shelf_run(u32 mask, int u)
+{
+	u32 run = (1u << u) - 1;
+	int b;
+	for (b = 0; b + u <= 16; b++) if (!(mask & (run << b))) return b;
+	return -1;
+}
+
+static void shelf_take(int p, int i, int b, int u, int stride, Slot *sl)
+{
+	Shelf *s = &shelves[p][i];
+	s->mask |= ((1u << u) - 1) << b;
+	sl->page = p; sl->sx = b << 4; sl->sy = s->y; sl->sh = s->h4;
+	(void)stride;
+}
+
+/* shelf heights: rows rounded up to a multiple of 4 (<= 32 rows), 8 (<= 64), 16 (<= 128) or 32 (<= 256), i.e. 20 height
+   classes; finer than a coarse set because the wasted rows inside a shelf cost more than the extra classes do (measured) */
+static int shelf_hclass(int rows)
+{
+	int step = rows <= 32 ? 4 : rows <= 64 ? 8 : rows <= 128 ? 16 : 32;
+	return (rows + step - 1) / step * step;
+}
+
+static int shelf_try(int stride, int rows, Slot *sl)
+{
+	int u = stride >> 4, p, i, b, bp = -1, bi = -1, bkey = 1 << 30, bside = 0, bb = 0, bh = 1000;
+	int H = shelf_hclass(rows), H4 = H >> 2, slack = rows / 8 + 4;
+	for (p = 0; p < NPAGES; p++) if (pclass[p] == 2)
+		for (i = 0; i < nshelf[p]; i++) {
+			Shelf *s = &shelves[p][i];
+			int h = s->h4 * 4;
+			if (!s->mask || h < rows || (h != H && h - rows > slack) || h >= bh) continue;
+			b = shelf_run(s->mask, u);
+			if (b >= 0) { bh = h; bp = p; bi = i; bb = b; }
+		}
+	if (bp >= 0) { shelf_take(bp, bi, bb, u, stride, sl); return 1; }
+	/* no shelf of this class with room: a free shelf that is tall enough; exact fit first, then next to a shelf of the
+	   class (the new shelf is cut from that side), then the smallest */
+	for (p = 0; p < NPAGES; p++) if (pclass[p] == 2)
+		for (i = 0; i < nshelf[p]; i++) {
+			Shelf *s = &shelves[p][i];
+			int key, side = 0;
+			if (s->mask || s->h4 < H4) continue;
+			if (s->h4 == H4) key = 0;
+			else {
+				if (i > 0 && s[-1].mask && s[-1].h4 == H4) key = 256;
+				else if (i + 1 < nshelf[p] && s[1].mask && s[1].h4 == H4) { key = 256; side = 1; }
+				else key = 512;
+				key += s->h4;
+			}
+			if (key < bkey) { bkey = key; bp = p; bi = i; bside = side; }
+		}
+	if (bp < 0) {   /* no room in the shelf pages: open the highest unused page */
+		for (p = NPAGES - 1; p >= 0 && pclass[p]; p--) ;
+		if (p < 0) return 0;
+		shelf_open(p);
+		bp = p; bi = 0;
+	}
+	{
+		Shelf *s = &shelves[bp][bi];
+		int h4 = s->h4;
+		if (h4 > H4 && nshelf[bp] < MAXSHELF) {
+			memmove(s + 2, s + 1, (nshelf[bp] - bi - 1) * sizeof(Shelf));
+			if (bside) {   /* keep the free rest in front, the new shelf at the end (next to the same-class shelf) */
+				s[1].y = s->y + (h4 - H4) * 4; s[1].h4 = H4; s[1].mask = 0;
+				s->h4 = h4 - H4;
+				nshelf[bp]++;
+				shelf_take(bp, bi + 1, 0, u, stride, sl);
+				return 1;
+			}
+			s[1].y = s->y + H; s[1].h4 = h4 - H4; s[1].mask = 0;
+			s->h4 = H4;
+			nshelf[bp]++;
+		}
+		shelf_take(bp, bi, 0, u, stride, sl);
+	}
+	return 1;
+}
+
+static void shelf_free(const Slot *sl)
+{
+	int p = sl->page, i, u = piece_stride(sl->w) >> 4;
+	Shelf *s;
+	for (i = 0; i < nshelf[p] && shelves[p][i].y != sl->sy; i++) ;
+	s = &shelves[p][i];
+	s->mask &= ~(((1u << u) - 1) << (sl->sx >> 4));
+	if (s->mask) return;
+	if (i + 1 < nshelf[p] && !s[1].mask) {
+		s->h4 += s[1].h4;
+		memmove(s + 1, s + 2, (nshelf[p] - i - 2) * sizeof(Shelf));
+		nshelf[p]--;
+	}
+	if (i > 0 && !s[-1].mask) {
+		s[-1].h4 += s->h4;
+		memmove(s, s + 1, (nshelf[p] - i - 1) * sizeof(Shelf));
+		nshelf[p]--;
+	}
+	if (nshelf[p] == 1 && !shelves[p][0].mask) pclass[p] = 0;
+}
+
+/* No shelf or free space fits a sprite of H rows: empty the shelf (or run of adjacent shelves whose heights cover H, free
+   ones included) whose most recent tile use is the oldest. Every tile on it must be resident, unlocked and unused
+   for `age` frames (the evict_lru() protection rules also apply). Returns 1 if tiles were evicted. */
+#define SHELF_AGE 30
+static int shelf_evict(int H, u32 age)
+{
+	u32 last[NPAGES][MAXSHELF], bl = 0, bt = 0;
+	u8 bad[NPAGES][MAXSHELF];
+	int s, p, i, j, bp = -1, bi = 0, bj = 0, n = 0;
+	memset(last, 0, sizeof(last)); memset(bad, 0, sizeof(bad));
+	for (s = 0; s < MAXSLOTS; s++) {
+		const Slot *sl = &slots[s];
+		if (!sl->state || sl->node >= 0) continue;
+		p = sl->page;
+		for (i = 0; i < nshelf[p] && shelves[p][i].y != sl->sy; i++) ;
+		if (i == nshelf[p]) continue;
+		if (sl->state != 2 || sl->lock || sl->lastuse + age > texframe || (evict_age > 1 && !sl->lastuse)) bad[p][i] = 1;
+		if (sl->lastuse > last[p][i]) last[p][i] = sl->lastuse;
+	}
+	for (p = 0; p < NPAGES; p++) if (pclass[p] == 2)
+		for (i = 0; i < nshelf[p]; i++) {
+			u32 mx = 0;
+			int h = 0;
+			for (j = i; j < nshelf[p] && !bad[p][j]; j++) {
+				h += shelves[p][j].h4 * 4;
+				if (last[p][j] > mx) mx = last[p][j];
+				if (h < H) continue;
+				if (bp < 0 || mx < bl || (mx == bl && (u32)h < bt)) { bp = p; bi = i; bj = j; bl = mx; bt = h; }
+				break;
+			}
+		}
+	if (bp < 0) return 0;
+	{
+		int y0 = shelves[bp][bi].y, y1 = shelves[bp][bj].y + shelves[bp][bj].h4 * 4;
+		for (s = 0; s < MAXSLOTS; s++) {
+			const Slot *sl = &slots[s];
+			if (sl->state && sl->node < 0 && sl->page == bp && sl->sy >= y0 && sl->sy < y1) { evict_slot(s); evict_count++; n++; }
+		}
+	}
+#ifdef PS1_PROF
+	prof_shelfev++;
+#endif
+	return n > 0;
+}
+
+/* last resort before evicting tiles that were used recently: room in any shelf at least as tall as the sprite (wastes rows) */
+static int shelf_try_tall(int stride, int rows, Slot *sl)
+{
+	int u = stride >> 4, p, i, b, bp = -1, bi = 0, bb = 0, bh = 1000;
+	for (p = 0; p < NPAGES; p++) if (pclass[p] == 2)
+		for (i = 0; i < nshelf[p]; i++) {
+			Shelf *s = &shelves[p][i];
+			int h = s->h4 * 4;
+			if (!s->mask || h < rows || h >= bh) continue;
+			b = shelf_run(s->mask, u);
+			if (b >= 0) { bh = h; bp = p; bi = i; bb = b; }
+		}
+	if (bp < 0) return 0;
+	shelf_take(bp, bi, bb, u, stride, sl);
+	return 1;
+}
+
+static int alloc_shelf(int stride, int rows, Slot *sl)
+{
+	int H = shelf_hclass(rows);
+	u32 age = evict_age > SHELF_AGE ? evict_age : SHELF_AGE;
+	for (;;) {
+		if (shelf_try(stride, rows, sl)) return 1;
+		if (reclaim_stale(1)) continue;
+		if (shelf_evict(H, age)) continue;
+		if (shelf_try_tall(stride, rows, sl)) return 1;
+#ifdef PS1_PROF
+		prof_shelflru++;
+#endif
+		if (!evict_lru(2)) return 0;
 	}
 }
 
@@ -316,7 +590,7 @@ static int alloc_slot(void)
 {
 	int s;
 	for (s = 0; s < MAXSLOTS; s++) if (!slots[s].state) return s;
-	if (!evict_lru()) return -1;
+	if (!evict_lru(0)) return -1;
 	for (s = 0; s < MAXSLOTS; s++) if (!slots[s].state) return s;
 	return -1;
 }
@@ -334,13 +608,19 @@ static int begin_load(int picnum, int piece, int *stride, int *h, u32 *sector)
 #endif
 	s = alloc_slot();
 	if (s < 0) return -1;
-	s16 n = alloc_block(w, hh);
-	if (n < 0) return -1;
 	Slot *sl = &slots[s];
-	nodes[n].state = 2; nodes[n].slot = s;
-	sl->picnum = picnum; sl->piece = piece; sl->node = n; sl->state = 1; sl->lock = 0; sl->half = half;
+	if (tilenpieces[picnum] <= 1 && (tileflags[picnum] & 2)) {   /* sprite class: shelf allocator */
+		if (!alloc_shelf(piece_stride(w), piece_rows(hh), sl)) { PROF_FAIL(1); return -1; }
+		sl->node = -1;
+	} else {
+		s16 n = alloc_block(w, hh);
+		if (n < 0) { PROF_FAIL(0); return -1; }
+		nodes[n].state = 2; nodes[n].slot = s;
+		sl->node = n;
+	}
+	sl->picnum = picnum; sl->piece = piece; sl->state = 1; sl->lock = 0; sl->half = half;
 	sl->w = w; sl->h = hh; sl->xoff = xoff; sl->yoff = yoff; sl->lastuse = texframe;
-	{ u32 blk = node_texels(n); vram_used += blk; active_texels += blk; }
+	{ u32 blk = slot_texels(sl); vram_used += blk; active_texels += blk; }
 	if (piece == 0) tile2slot[picnum] = s;
 	*stride = piece_stride(w); *h = piece_rows(hh); *sector = sec;
 	tex_stat_resident++;
@@ -351,10 +631,10 @@ static int begin_load(int picnum, int piece, int *stride, int *h, u32 *sector)
 static void finish_load_from(int s, int stride, int h, const void *src)
 {
 	Slot *sl = &slots[s];
-	Node *n = &nodes[sl->node];
-	const Page *pg = &pages[n->page];
+	int pgi = sl->node >= 0 ? nodes[sl->node].page : sl->page;
+	int px = sl->node >= 0 ? nodes[sl->node].x : sl->sx, py = sl->node >= 0 ? nodes[sl->node].y : sl->sy;
 	RECT r;
-	r.x = pg->cellx + (n->x >> 1); r.y = pg->celly + n->y; r.w = stride >> 1; r.h = h;
+	r.x = pages[pgi].cellx + (px >> 1); r.y = pages[pgi].celly + py; r.w = stride >> 1; r.h = h;
 	LoadImage(&r, (u32 *)src);
 	DrawSync(0);   /* called while the GPU is idle (see tex_frame); the staging buffer is reused right after */
 	sl->state = 2;
@@ -426,7 +706,7 @@ static void mark_old(int s)
 {
 	Slot *sl = &slots[s];
 	sl->lastuse = 0;
-	if (!slot_active(sl) && active_frame == texframe) { u32 b = node_texels(sl->node); active_texels = active_texels > b ? active_texels - b : 0; }
+	if (!slot_active(sl) && active_frame == texframe) { u32 b = slot_texels(sl); active_texels = active_texels > b ? active_texels - b : 0; }
 }
 
 /* % of the cache VRAM that is free or held by unlocked slots used before but unused for PF_AGE frames */
@@ -436,7 +716,7 @@ int tex_evictable_pct(void)
 	int s;
 	for (s = 0; s < MAXSLOTS; s++) {
 		const Slot *sl = &slots[s];
-		if (sl->state == 2 && !sl->lock && sl->node >= 0 && sl->lastuse && sl->lastuse + PF_AGE < texframe) t += node_texels(sl->node);
+		if (sl->state == 2 && !sl->lock && sl->lastuse && sl->lastuse + PF_AGE < texframe) t += slot_texels(sl);
 	}
 	return (int)(t * 100 / VRAM_TEXELS);
 }
@@ -820,24 +1100,31 @@ int tex_lookup(int picnum, int piece, TexRef *out)
 	int s = find_slot(picnum, piece);
 	if (s >= 0 && slots[s].state == 2) {
 		Slot *sl = &slots[s];
-		Node *n = &nodes[sl->node];
-		const Page *pg = &pages[n->page];
+		int pgi, px, py;
 #ifdef PS1_PROF
 		if (sl->lastuse == 0) prof_rahit++;   /* a read-ahead tile used for the first time */
 #endif
 		sl->lastuse = texframe;
-		out->tpage = getTPage(1, 0, pg->cellx, pg->celly);
-		out->u = n->x; out->v = n->y;
+		if (sl->node >= 0) {
+			Node *n = &nodes[sl->node];
+			pgi = n->page; px = n->x; py = n->y;
+			out->bw = 1 << n->lw; out->bh = 1 << n->lh;
+			{
+				int mw = (~((out->bw >> 3) - 1)) & 31, mh = (~((out->bh >> 3) - 1)) & 31;
+				out->twin = 0xe2000000 | mw | (mh << 5) | (((n->x >> 3) & 31) << 10) | (((n->y >> 3) & 31) << 15);
+			}
+		} else {   /* PS1: shelf tile: never wraps (bw/bh can never equal w/h), no texture window */
+			pgi = sl->page; px = sl->sx; py = sl->sy;
+			out->bw = out->bh = 512;
+			out->twin = 0xe2000000;
+		}
+		out->tpage = getTPage(1, 0, pages[pgi].cellx, pages[pgi].celly);
+		out->u = px; out->v = py;
 		out->w = sl->w; out->h = sl->h;
-		out->bw = 1 << n->lw; out->bh = 1 << n->lh;
 		out->xoff = sl->xoff; out->yoff = sl->yoff;
 		out->picnum = picnum; out->tw = tilesizx[picnum]; out->th = tilesizy[picnum];
 		out->npieces = tilenpieces[picnum] ? tilenpieces[picnum] : 1;
 		out->half = sl->half;
-		{
-			int mw = (~((out->bw >> 3) - 1)) & 31, mh = (~((out->bh >> 3) - 1)) & 31;
-			out->twin = 0xe2000000 | mw | (mh << 5) | (((n->x >> 3) & 31) << 10) | (((n->y >> 3) & 31) << 15);
-		}
 		return 1;
 	}
 	tex_stat_misses++;

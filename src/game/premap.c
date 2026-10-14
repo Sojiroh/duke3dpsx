@@ -58,6 +58,7 @@ extern void tex_preload_list(const short *tiles, int n);
 extern void tex_preload_range(int first, int last, int lock);
 extern void video_wait_gpu(void);
 extern int tex_vram_pct(void);
+extern void sound_preload_group(void);
 
 /* PS1: the font tiles used by every text screen and the HUD stay resident (locked) so that the first
    text never stalls on one CD read per glyph. */
@@ -91,6 +92,7 @@ void precachenecessarysounds(void)
 
     if (FXDevice == NumSoundCards) return;
     j = 0;
+    sound_preload_group();   /* PS1: coalesced CD reads from the SNDGRP preload group; the loop below takes the rest */
 
     for(i=0;i<NUM_SOUNDS;i++)
         if(Sound[i].ptr == 0)

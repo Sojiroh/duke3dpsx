@@ -28,7 +28,10 @@
 typedef struct { short x, y; int u, v; unsigned char c; } QV;  /* u,v unwrapped texels; c brightness 0..128 */
 
 static u32 last_twin;
-static int rend_sync_loads;      /* 2D path (rotatesprite): load missing tiles synchronously; also marks the 2D phase (no primitive reserve) */
+static int rend_sync_loads;      /* 2D path (rotatesprite): load missing tiles synchronously */
+static int rend_in_2d;           /* inside rotatesprite: marks the 2D phase (no primitive reserve) */
+static int rend_2d_async_mode;   /* PS1: in-game overlays: a missing tile is queued (sprite priority) and skipped this frame instead of loaded synchronously */
+void rend_2d_async(int on) { rend_2d_async_mode = on; }
 int rend_dropped_3d;             /* 3D strips/quads dropped because only the 2D/tint reserve was left (stat) */
 int rend_mirrors_supported = 0;  /* completemirror() cannot reverse the screen on the GPU path: the game skips its mirror pass */
 static int keepalive_frame = -1;
@@ -150,7 +153,7 @@ static inline int floordiv(int a, int b) { return (a >= 0) ? a / b : -((-a + b -
 
 /* PS1: the 3D emitters stop PRIM_RESERVE bytes before the end of the primitive buffer so that the 2D
    overlay emitted after the 3D pass (weapon, HUD, menus via rotatesprite, and the tint) always fits. */
-static inline int prim_3d_full(void) { return !rend_sync_loads && (prim_end - prim_cur) < PRIM_RESERVE; }
+static inline int prim_3d_full(void) { return !rend_in_2d && (prim_end - prim_cur) < PRIM_RESERVE; }
 
 static void emit_quad_final(const TexRef *ref, u16 clut, const QV *q, int trans, int gouraud, int ubase, int vbase, int uadd, int vadd)
 {
@@ -1176,12 +1179,14 @@ static void dorotatesprite(long sx, long sy, long z, short a, short picnum, sign
 	bright = shadebright[getpalookup(0, dashade)];
 	trans = (dastat & 1) != 0;
 	clut = clut_get(dapalnum, 0);
-	rend_sync_loads = 1;
+	rend_in_2d = 1;
+	rend_sync_loads = !rend_2d_async_mode;
 	{
 		TexRef ref;
 		QV q[4];
 		int k;
-		if (!tex_lookup_sync(picnum, 0, &ref)) { if (clipped) set_cliprect(0, 0, xdim - 1, ydim - 1); return; }
+		if (rend_sync_loads) { if (!tex_lookup_sync(picnum, 0, &ref)) { rend_in_2d = 0; rend_sync_loads = 0; if (clipped) set_cliprect(0, 0, xdim - 1, ydim - 1); return; } }
+		else if (!tex_resident(picnum, 1) || !tex_lookup(picnum, 0, &ref)) { rend_in_2d = 0; if (clipped) set_cliprect(0, 0, xdim - 1, ydim - 1); return; }   /* a partial miss skips the whole tile this frame */
 		int ufar = xsiz, vfar = ysiz;
 		/* PS1: far corners sit on the exclusive edge xsiz/ysiz so a 1:1 glyph samples every texel (the GPU
 		   reads texel floor(u) at a pixel's left/top edge); -1 only if the 8-bit window cannot hold it */
@@ -1201,6 +1206,7 @@ static void dorotatesprite(long sx, long sy, long z, short a, short picnum, sign
 		}
 		emit_quad(&ref, clut, q, trans, 0, 0);
 	}
+	rend_in_2d = 0;
 	rend_sync_loads = 0;
 	if (clipped) set_cliprect(0, 0, xdim - 1, ydim - 1);
 }

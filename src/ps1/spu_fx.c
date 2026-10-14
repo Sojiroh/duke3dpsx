@@ -212,15 +212,10 @@ static u32 cache_find_gap(u32 size)
 	return 0;
 }
 
-int FX_LoadSample(fx_sample *s)
+/* PS1: find room for a `size`-byte sample (evicting LRU samples no voice plays); returns the slot index
+   and the SPU address in *addr, or -1. */
+static int slot_alloc(u32 size, u32 *addr_out)
 {
-	if (!s || s->magic != FX_SAMPLE_MAGIC) return 0;
-	if (s->slot) {
-		slots[s->slot - 1].last = fx_clock();
-		return 1;
-	}
-	u32 size = (s->size + 63) & ~63u;
-	if (size == 0 || size > SPU_FX_LIMIT - SPU_FX_BASE) return 0;
 	u32 addr;
 	while (!(addr = cache_find_gap(size))) {
 		/* evict the least recently used sample that no voice is playing */
@@ -228,7 +223,7 @@ int FX_LoadSample(fx_sample *s)
 		for (int i = 0; i < NSLOTS; i++)
 			if (slots[i].s && !slot_in_use(i) && (victim < 0 || (long)(slots[victim].last - slots[i].last) > 0))
 				victim = i;
-		if (victim < 0) return 0;
+		if (victim < 0) return -1;
 		slot_free(victim);
 		cache_evicts++;
 	}
@@ -239,18 +234,83 @@ int FX_LoadSample(fx_sample *s)
 		int victim = -1;
 		for (int i = 0; i < NSLOTS; i++)
 			if (!slot_in_use(i) && (victim < 0 || (long)(slots[victim].last - slots[i].last) > 0)) victim = i;
-		if (victim < 0) return 0;
+		if (victim < 0) return -1;
 		slot_free(victim);
 		fi = victim;
 	}
-	if (spu_load_adpcm(s->sector, s->size, addr, s->loop) < 0) return 0;
+	*addr_out = addr;
+	return fi;
+}
+
+static void slot_commit(int fi, u32 addr, u32 size, fx_sample *s)
+{
 	slots[fi].addr = addr;
 	slots[fi].size = size;
 	slots[fi].s = s;
 	slots[fi].last = fx_clock();
 	s->slot = (u8)(fi + 1);
 	cache_loads++;
+}
+
+int FX_LoadSample(fx_sample *s)
+{
+	if (!s || s->magic != FX_SAMPLE_MAGIC) return 0;
+	if (s->slot) {
+		slots[s->slot - 1].last = fx_clock();
+		return 1;
+	}
+	u32 size = (s->size + 63) & ~63u;
+	if (size == 0 || size > SPU_FX_LIMIT - SPU_FX_BASE) return 0;
+	u32 addr;
+	int fi = slot_alloc(size, &addr);
+	if (fi < 0) return 0;
+	if (spu_load_adpcm(s->sector, s->size, addr, s->loop) < 0) return 0;
+	slot_commit(fi, addr, size, s);
 	return 1;
+}
+
+/* PS1: preload samples stored back to back (16-byte aligned) in a group.  list[i] lives at byte offset
+   off[i] (ascending) relative to the group start sector grp_sector.  Samples whose sectors fit in `stage`
+   are fetched with one pak_read of up to bufbytes (4-byte aligned, caller-owned), then each is uploaded to
+   its cache slot.  Returns the number of samples now resident. */
+int FX_PreloadGroup(fx_sample **list, const u32 *off, int n, u32 grp_sector, void *stage, u32 bufbytes)
+{
+	u8 *buf = (u8 *)stage;
+	int loaded = 0;
+	int i = 0;
+	while (i < n) {
+		fx_sample *s = list[i];
+		if (s->slot) { slots[s->slot - 1].last = fx_clock(); loaded++; i++; continue; }
+		u32 first = off[i] / 2048;
+		if ((off[i] + s->size + 2047) / 2048 - first > bufbytes / 2048) {
+			loaded += FX_LoadSample(s) ? 1 : 0;
+			i++;
+			continue;
+		}
+		int j = i;  /* chunk = list[i..j] */
+		while (j + 1 < n && !list[j + 1]->slot &&
+		       (off[j + 1] + list[j + 1]->size + 2047) / 2048 - first <= bufbytes / 2048)
+			j++;
+		u32 span = (off[j] + list[j]->size + 2047) / 2048 - first;
+		if (pak_read(grp_sector + first, (int)span, buf) < 0) return loaded;
+		for (int k = i; k <= j; k++) {
+			fx_sample *t = list[k];
+			u32 size = (t->size + 63) & ~63u;
+			u8 *p = buf + (off[k] - first * 2048);
+			u32 addr;
+			int fi = slot_alloc(size, &addr);
+			if (fi < 0) continue;
+			if (t->loop) {
+				p[1] |= 0x04;
+				p[t->size - 32 + 1] |= 0x03;
+			}
+			spu_dma_write(addr, p, size);
+			slot_commit(fi, addr, size, t);
+			loaded++;
+		}
+		i = j + 1;
+	}
+	return loaded;
 }
 
 int FX_CacheSize(void) { return (int)(SPU_FX_LIMIT - SPU_FX_BASE); }
