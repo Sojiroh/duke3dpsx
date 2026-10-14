@@ -1122,6 +1122,12 @@ void drawmaskwall(short damaskwallcnt)
 	}
 }
 
+/* PS1: per sprite, the last picnum that was resident and drawn (0 = none yet) and when (totalclock, 16 bits);
+   see drawsprite */
+static u16 sprlastpic[MAXSPRITES], sprlasttc[MAXSPRITES];
+#define SPRHOLD_TICKS 240   /* a held frame is only reused if it was drawn within 2 s (120 ticks/s) ... */
+#define SPRHOLD_FAMILY 160  /* ... and is an animation frame of the same actor (a recycled sprite slot must not show the old sprite) */
+
 void drawsprite (long snum)
 {
 	PROF_COUNT(prof_nsprites, 1);
@@ -1151,6 +1157,25 @@ void drawsprite (long snum)
 		if (picanm[tilenum]&192) tilenum += animateoffs(tilenum,spritenum+32768);
 		if ((tilesizx[tilenum] <= 0) || (tilesizy[tilenum] <= 0) || (spritenum < 0))
 			return;
+		/* PS1: the requested frame streams in from CD asynchronously and an unresident tile is not drawn (the
+		   sprite would vanish for ~0.2 s per new animation frame). Keep drawing the last frame that was
+		   resident for this sprite until the new one has loaded (tex_resident queues the load, ahead of
+		   wall/floor tiles). Skipped for the tsprite copies appended by animatesprites (shadows, held weapons:
+		   statnum 99), which share the owner of the sprite they decorate. */
+		if ((unsigned)spritenum < MAXSPRITES && tspr->statnum != 99)
+		{
+			if (tex_resident(tilenum,1))
+			{
+				sprlastpic[spritenum] = tilenum; sprlasttc[spritenum] = (u16)totalclocklock;
+			}
+			else
+			{
+				k = sprlastpic[spritenum];
+				if (k != 0 && (u16)((u16)totalclocklock-sprlasttc[spritenum]) < SPRHOLD_TICKS &&
+					klabs(k-tilenum) <= SPRHOLD_FAMILY && tex_resident(k,0))
+					tilenum = k;
+			}
+		}
 	}
 	if ((tspr->xrepeat <= 0) || (tspr->yrepeat <= 0)) return;
 

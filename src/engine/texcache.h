@@ -19,6 +19,7 @@ void tex_init(void);
 void *tex_staging(void);                              /* 64 KB CD staging buffer (free to borrow before tex_init) */
 int tex_lookup(int picnum, int piece, TexRef *out);   /* 1 = resident (marks LRU); 0 = not (queues a load) */
 int tex_npieces(int picnum);
+int tex_resident(int picnum, int request);           /* 1 = all pieces resident (no LRU touch); request=1 queues a load when missing */
 int tex_lookup_sync(int picnum, int piece, TexRef *out);  /* like tex_lookup but loads synchronously on a miss */
 void tex_preload(int picnum);
 void tex_preload_range(int first, int last, int lock);  /* single-piece tiles, batched CD reads, optionally locked resident */                         /* synchronous load of all pieces */

@@ -279,11 +279,12 @@ static void emit_quad_pieces(const TexRef *ref, u16 clut, const QV *q, int trans
 }
 
 /* q: 0=TL 1=TR 2=BL 3=BR; u,v in full-resolution texels of the tile */
+static int emit_single_v;   /* set by wall_spans for masked quads: V never repeats (see emit_quad) */
 static void emit_quad(const TexRef *ref, u16 clut, const QV *q, int trans, int gouraud, int depth)
 {
 	int umin, umax, vmin, vmax, i, ubase, vbase, ulim, vlim, uadd, vadd, uneed, vneed;
 	int wrapw = (ref->w == ref->bw), wraph = (ref->h == ref->bh);
-	QV hq[4];
+	QV hq[4], vq[4];
 	if (depth == 0 && prim_3d_full()) { rend_dropped_3d++; return; }
 
 	if (ref->half && depth == 0) {
@@ -333,6 +334,28 @@ static void emit_quad(const TexRef *ref, u16 clut, const QV *q, int trans, int g
 	else {
 		vbase = floordiv(vmin, ref->h) * ref->h; vadd = ref->v;
 		vlim = (ref->v + ref->h <= 255) ? ref->h : ref->h - 1;
+		/* PS1: the software renderer's V wraps at the next power of two above the tile height
+		   (vplc >> globalshiftval, shift = 32 - ceil(log2 h)), and sprites / masked walls (one image, never
+		   tiled vertically) start at an arbitrary multiple of it.  Wrapping at h instead rotated a non-pow2
+		   sprite (tile 52, h 27: v 65..92 was drawn as rows 11..26 then 0..11).  For single-image quads use
+		   the power-of-two period's base and clamp the few rounding texels that stick out into the padding. */
+		if (emit_single_v) {
+			int period = 1;
+			while (period < ref->th) period <<= 1;
+			if (ref->half) period >>= 1;
+			if (period > ref->h) {
+				int pb = ((vmin + vmax) >> 1) & ~(period - 1);
+				QV *vc = vq;
+				for (i = 0; i < 4; i++) {
+					vc[i] = q[i];
+					if (vc[i].v < pb) vc[i].v = pb;
+					if (vc[i].v > pb + vlim) vc[i].v = pb + vlim;
+				}
+				q = vc; vbase = pb;
+				vmin = vmax = q[0].v;
+				for (i = 1; i < 4; i++) { if (q[i].v < vmin) vmin = q[i].v; if (q[i].v > vmax) vmax = q[i].v; }
+			}
+		}
 	}
 	uneed = (umax - ubase > ulim);
 	vneed = (vmax - vbase > vlim);
@@ -559,7 +582,7 @@ static void wall_spans(long x1, long x2, short *uwal, short *dwal, long *swal, l
 		q[1].x = xr << REND_XSHIFT; q[1].y = topR; q[1].u = ur; q[1].v = wall_v(swr, topR); q[1].c = wall_bright(swr);
 		q[2].x = xa << REND_XSHIFT; q[2].y = botL; q[2].u = ua; q[2].v = wall_v(swa, botL); q[2].c = q[0].c;
 		q[3].x = xr << REND_XSHIFT; q[3].y = botR; q[3].u = ur; q[3].v = wall_v(swr, botR); q[3].c = q[1].c;
-		if (have) emit_quad(&ref, clut, q, trans, 1, 0);
+		if (have) { emit_single_v = (mode != 0); emit_quad(&ref, clut, q, trans, 1, 0); emit_single_v = 0; }
 		else if (mode == 0) emit_flat(q, tileavg[globalpicnum], 0);
 		x = xb + 1;
 	}

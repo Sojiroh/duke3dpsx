@@ -36,12 +36,17 @@ tloadtile(short tilenume)
     gotpic[tilenume>>3] |= (1<<(tilenume&7));
 }
 
+/* PS1: tiles requested by cachespritenum(); docacheit() loads them before the wall/floor tiles so that the VRAM
+   budget never cuts off the sprites (a sprite with a missing tile is not drawn, a wall gets a placeholder) */
+static unsigned char spritetile[(MAXTILES+7)>>3];
+
 void cachespritenum(short i)
 {
     /* PS1: only the sprite's own tile is preloaded; animation frames, jibs and other related tiles
        stream in on demand (the VRAM cache is small and every CD seek costs ~100 ms). */
     if(ud.monsters_off && badguy(&sprite[i])) return;
     tloadtile(PN);
+    spritetile[PN>>3] |= 1<<(PN&7);
 }
 
 /* PS1: loading screen: percentage at the end of each stage of enterlevel() (see loadscreen.c); measured for
@@ -165,12 +170,13 @@ void docacheit(void)
         if( (gotpic[i>>3]&(1<<(i&7))) && tilesizx[i] > 0 && tilesizy[i] > 0)
             list[n++] = i;
 
-    /* insertion sort by sector */
+    /* insertion sort: sprite tiles first, each group by sector */
+#define PRELOAD_KEY(t) (tex_sector(t) | ((spritetile[(t)>>3]&(1<<((t)&7))) ? 0 : 0x80000000u))
     for(i=1;i<n;i++)
     {
         k = list[i];
-        key = tex_sector(k);
-        for(j=i-1;j>=0 && tex_sector(list[j]) > key;j--) list[j+1] = list[j];
+        key = PRELOAD_KEY(k);
+        for(j=i-1;j>=0 && PRELOAD_KEY(list[j]) > key;j--) list[j+1] = list[j];
         list[j+1] = k;
     }
 
@@ -189,6 +195,7 @@ void docacheit(void)
     dbg("docacheit: %ld tiles requested, vram %d%%\n", n, tex_vram_pct());
 
     clearbufbyte(gotpic,sizeof(gotpic),0L);
+    clearbufbyte(spritetile,sizeof(spritetile),0L);
 }
 
 

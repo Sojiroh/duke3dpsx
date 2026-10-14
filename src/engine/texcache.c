@@ -143,6 +143,7 @@ static PieceRec piecetab[DAT_NUMPIECES > 0 ? DAT_NUMPIECES : 1] __attribute__((a
 #define QLEN 64
 static u16 queue[QLEN];
 static int qhead, qtail;
+static int nprio;               /* queue entries at the head that are sprite requests (see queue_tile_prio) */
 static u8 pendingbit[(MAXTILES + 7) >> 3];
 static u32 staging[65536 / 4];
 void *tex_staging(void) { return staging; }
@@ -183,7 +184,7 @@ void tex_init(void)
 	for (i = 0; i < MAXSLOTS; i++) slots[i].state = 0;
 	for (i = 0; i < MAXTILES; i++) tile2slot[i] = 0xffff;
 	memset(pendingbit, 0, sizeof(pendingbit));
-	qhead = qtail = 0;
+	qhead = qtail = nprio = 0;
 	tiledata = pak_find("TILEDATA");
 	if (!tiledata) fatal("TILEDATA missing");
 	const PakEntry *e = pak_find("PIECES");
@@ -302,6 +303,32 @@ static void queue_tile(int picnum)
 	pendingbit[picnum >> 3] |= 1 << (picnum & 7);
 }
 
+/* PS1: sprite tiles jump ahead of the wall/floor tiles waiting in the queue (a sprite whose tile is not
+   resident is not drawn at all, while a wall shows a flat placeholder). The first nprio queue entries are
+   the sprite requests, in request order; a tile already queued as a wall/floor tile is moved up. */
+static void queue_tile_prio(int picnum)
+{
+	int n = (qtail - qhead) & (QLEN - 1), i, j;
+	if (pendingbit[picnum >> 3] & (1 << (picnum & 7))) {
+		for (i = 0; i < n; i++) if (queue[(qhead + i) & (QLEN - 1)] == picnum) break;
+		if (i < nprio || i >= n) return;   /* already in the priority zone */
+		j = i;
+	} else {
+		if (n == QLEN - 1) {   /* full: the newest wall/floor request is re-issued by the next frame that needs it */
+			qtail = (qtail - 1) & (QLEN - 1);
+			pendingbit[queue[qtail] >> 3] &= ~(1 << (queue[qtail] & 7));
+			n--;
+			if (nprio > n) nprio = n;
+		}
+		qtail = (qtail + 1) & (QLEN - 1);
+		pendingbit[picnum >> 3] |= 1 << (picnum & 7);
+		j = n;
+	}
+	for (; j > nprio; j--) queue[(qhead + j) & (QLEN - 1)] = queue[(qhead + j - 1) & (QLEN - 1)];
+	queue[(qhead + nprio) & (QLEN - 1)] = picnum;
+	nprio++;
+}
+
 /* cd_done: 0 = read pending, 1 = staged data valid, -1 = CD error (the staging buffer is not valid) */
 static void cd_cb(int ok) { cd_done = ok ? 1 : -1; }
 
@@ -383,6 +410,7 @@ static void pump(void)
 		int picnum = queue[qhead];
 		int p, np;
 		qhead = (qhead + 1) & (QLEN - 1);
+		if (nprio) nprio--;
 		pendingbit[picnum >> 3] &= ~(1 << (picnum & 7));
 		np = tilenpieces[picnum] ? tilenpieces[picnum] : 1;
 		for (p = 0; p < np; p++) {
@@ -436,6 +464,21 @@ int tex_lookup(int picnum, int piece, TexRef *out)
 
 int tex_npieces(int picnum) { return tilenpieces[picnum] ? tilenpieces[picnum] : 1; }
 
+/* PS1: 1 if every piece of the tile is resident in VRAM (does not touch LRU, no miss stat). When request is set
+   and the tile is neither resident nor already loading, it is queued for streaming like a tex_lookup() miss. */
+int tex_resident(int picnum, int request)
+{
+	int p, np = tilenpieces[picnum] ? tilenpieces[picnum] : 1, ok = 1;
+	for (p = 0; p < np; p++) {
+		int s = find_slot(picnum, p);
+		if (s >= 0 && slots[s].state == 2) continue;
+		ok = 0;
+		if (s < 0 && request) queue_tile_prio(picnum);
+		break;
+	}
+	return ok;
+}
+
 int tex_lookup_sync(int picnum, int piece, TexRef *out)
 {
 	if (tex_lookup(picnum, piece, out)) return 1;
@@ -464,7 +507,7 @@ void tex_frame(void)
 void tex_quiesce(void)
 {
 	while (!inflight_finish()) ;
-	qhead = qtail = 0;
+	qhead = qtail = nprio = 0;
 	memset(pendingbit, 0, sizeof(pendingbit));
 }
 
