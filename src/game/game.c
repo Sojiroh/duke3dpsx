@@ -406,7 +406,6 @@ adduserquote(char *daquote)
 }
 
 
-static int ps1_clear3d;   /* frames left that start with a cleared 3D view */
 static int ps1_inframe;   /* main loop is between the start of an iteration and nextpage() */
 
 void getpackets(void)
@@ -1705,13 +1704,6 @@ void displayrest(long smoothratio)
 
     pp = &ps[screenpeek];
 
-    {
-        static short lastfta; static char lastmenu;
-        char m = (ps[myconnectindex].gm&MODE_MENU) != 0;
-        if( (lastfta && !pp->fta) || (lastmenu && !m) ) ps1_clear3d = 2;
-        lastfta = pp->fta; lastmenu = m;
-    }
-
     if( pp->pals_time > 0 && pp->loogcnt == 0)
     {
         palto( pp->pals[0],
@@ -2392,10 +2384,10 @@ void displayrooms(short snum,long smoothratio)
 #ifdef PS1_HOLES
         clearview(31);   /* debug: pixels the 3D pass does not cover show up in this colour */
 #else
-        /* The 3D pass leaves a few 1-pixel gaps between neighbouring polygons; they keep the pixels of the
-           frame drawn two flips ago.  After UI text was drawn into the view (menu, pickup messages) that text
-           would linger in the gaps, so clear the view once for both buffers when such text goes away. */
-        if(ps1_clear3d > 0) { ps1_clear3d--; clearview(0); }
+        /* PS1: the 3D pass can still leave isolated 1-pixel gaps between neighbouring polygons; they would keep the
+           pixels of the frame drawn two flips ago (menu/message text lingers).  One flat GPU rectangle, first in
+           the primitive list, makes every uncovered pixel black instead. */
+        clearview(0);
 #endif
         PFS_MARK();
         drawrooms(cposx,cposy,cposz,cang,choriz,sect);

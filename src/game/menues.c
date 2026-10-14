@@ -2176,6 +2176,11 @@ void menus(void)
             {
                 KB_FlushKeyboardQueue();
 
+                /* PS1: fade the last presented frame to black (rend_represent) before the restart; the
+                   original cut to black here (gameexit() -> Logo()) */
+                if( numplayers < 2 )
+                    for(x=0;x<64;x+=7) palto(0,0,0,x);
+
                 if( gamequit == 0 && ( numplayers > 1 ) )
                 {
                     if(ps[myconnectindex].gm&MODE_GAME)
@@ -2223,6 +2228,8 @@ void menus(void)
             if( KB_KeyPressed(sc_Space) || KB_KeyPressed(sc_Enter) || KB_KeyPressed(sc_kpad_Enter) || KB_KeyPressed(sc_Y) || LMB )
             {
                 KB_FlushKeyboardQueue();
+                /* PS1: fade out; the original jumped straight to black here (MODE_DEMO -> Logo()) */
+                for(x=0;x<64;x+=7) palto(0,0,0,x);
                 ps[myconnectindex].gm = MODE_DEMO;
                 if(ud.recstat == 1)
                     closedemowrite();

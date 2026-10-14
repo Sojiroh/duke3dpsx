@@ -169,6 +169,61 @@ char *keyw[NUMKEYWORDS] =
     "ifangdiffl" // 111
 };
 
+/* PS1: the CON compile did ~50k strcmp scans over keyw[] and ~1400 labels; both are now looked up through
+   open-addressing hash tables (FNV-1a) with the same strcmp match semantics. */
+#define KW_HASH 256                 /* > 2 * NUMKEYWORDS */
+#define LB_HASH 4096                /* > 2 * the 3072 labels that fit in wall[] */
+static unsigned char kw_tab[KW_HASH];  /* keyw index + 1, 0 = empty */
+static unsigned short lb_tab[LB_HASH]; /* label index + 1, 0 = empty */
+
+static unsigned fnv1a(const char *s)
+{
+    unsigned h = 2166136261u;
+    while( *s ) h = (h ^ (unsigned char)*s++) * 16777619u;
+    return h;
+}
+
+/* Index of the keyword equal to s, or -1 */
+static long kw_find(const char *s)
+{
+    static char ready;
+    unsigned k;
+    if( !ready )
+    {
+        int i;
+        ready = 1;
+        for(i=0;i<NUMKEYWORDS;i++) /* ascending: with duplicate names the lowest index would be probed first */
+        {
+            for(k=fnv1a(keyw[i])&(KW_HASH-1);kw_tab[k];k=(k+1)&(KW_HASH-1));
+            kw_tab[k] = i+1;
+        }
+    }
+    for(k=fnv1a(s)&(KW_HASH-1);kw_tab[k];k=(k+1)&(KW_HASH-1))
+        if( strcmp(s,keyw[kw_tab[k]-1]) == 0 )
+            return kw_tab[k]-1;
+    return -1;
+}
+
+/* Lowest label index whose name equals s (what the old linear scan returned), or -1 */
+static long lb_find(const char *s)
+{
+    unsigned k;
+    for(k=fnv1a(s)&(LB_HASH-1);lb_tab[k];k=(k+1)&(LB_HASH-1))
+        if( strcmp(s,label+((lb_tab[k]-1)<<6)) == 0 )
+            return lb_tab[k]-1;
+    return -1;
+}
+
+/* Index label n (its name is at label+(n<<6)); a name that already exists keeps its lower index */
+static void lb_add(long n)
+{
+    unsigned k;
+    for(k=fnv1a(label+(n<<6))&(LB_HASH-1);lb_tab[k];k=(k+1)&(LB_HASH-1))
+        if( strcmp(label+(n<<6),label+((lb_tab[k]-1)<<6)) == 0 )
+            return;
+    lb_tab[k] = n+1;
+}
+
 
 short getincangle(short a,short na)
 {
@@ -202,9 +257,15 @@ char ispecial(char c)
     return 0;
 }
 
-char isaltok(char c)
+/* PS1: isaltok() ran for every source character as a function call into libc isalnum(); a 256-entry table
+   (filled by altok_init() from the same predicate) replaces it. The old external function had no other caller. */
+static unsigned char altok_tab[256];
+#define isaltok(c) (altok_tab[(unsigned char)(c)])
+static void altok_init(void)
 {
-    return ( isalnum(c) || c == '{' || c == '}' || c == '/' || c == '*' || c == '-' || c == '_' || c == '.');
+    int c;
+    for(c=0;c<256;c++)
+        altok_tab[c] = ( isalnum(c) || c == '{' || c == '}' || c == '/' || c == '*' || c == '-' || c == '_' || c == '.') != 0;
 }
 
 void getglobalz(short i)
@@ -335,11 +396,7 @@ long keyword(void)
     }
     tempbuf[i] = 0;
 
-    for(i=0;i<NUMKEYWORDS;i++)
-        if( strcmp( tempbuf,keyw[i]) == 0 )
-            return i;
-
-    return -1;
+    return kw_find((char *)tempbuf);
 }
 
 long transword(void) //Returns its code #
@@ -362,15 +419,13 @@ long transword(void) //Returns its code #
     }
     tempbuf[l] = 0;
 
-    for(i=0;i<NUMKEYWORDS;i++)
+    i = kw_find((char *)tempbuf);
+    if( i >= 0 )
     {
-        if( strcmp( tempbuf,keyw[i]) == 0 )
-        {
-            *scriptptr = i;
-            textptr += l;
-            scriptptr++;
-            return i;
-        }
+        *scriptptr = i;
+        textptr += l;
+        scriptptr++;
+        return i;
     }
 
     textptr += l;
@@ -412,24 +467,20 @@ void transnum(void)
     }
     tempbuf[l] = 0;
 
-    for(i=0;i<NUMKEYWORDS;i++)
-        if( strcmp( label+(labelcnt<<6),keyw[i]) == 0 )
+    if( kw_find(label+(labelcnt<<6)) >= 0 )
     {
         error++;
         printf("  * ERROR!(L%ld) Symbol '%s' is a key word.\n",line_number,label+(labelcnt<<6));
         textptr+=l;
     }
 
-
-    for(i=0;i<labelcnt;i++)
+    i = lb_find((char *)tempbuf);
+    if( i >= 0 )
     {
-        if( strcmp(tempbuf,label+(i<<6)) == 0 )
-        {
-            *scriptptr = labelcode[i];
-            scriptptr++;
-            textptr += l;
-            return;
-        }
+        *scriptptr = labelcode[i];
+        scriptptr++;
+        textptr += l;
+        return;
     }
 
     if( isdigit(*textptr) == 0 && *textptr != '-')
@@ -488,6 +539,7 @@ char parsecommand(void)
                 getlabel();
                 scriptptr--;
                 labelcode[labelcnt] = (long) scriptptr;
+                lb_add(labelcnt);
                 labelcnt++;
 
                 parsing_state = 1;
@@ -497,24 +549,17 @@ char parsecommand(void)
 
             getlabel();
 
-            for(i=0;i<NUMKEYWORDS;i++)
-                if( strcmp( label+(labelcnt<<6),keyw[i]) == 0 )
-                {
-                    error++;
-                    printf("  * ERROR!(L%ld) Symbol '%s' is a key word.\n",line_number,label+(labelcnt<<6));
-                    return 0;
-                }
-
-            for(j=0;j<labelcnt;j++)
+            if( kw_find(label+(labelcnt<<6)) >= 0 )
             {
-                if( strcmp(label+(j<<6),label+(labelcnt<<6)) == 0 )
-                {
-                    *scriptptr = labelcode[j];
-                    break;
-                }
+                error++;
+                printf("  * ERROR!(L%ld) Symbol '%s' is a key word.\n",line_number,label+(labelcnt<<6));
+                return 0;
             }
 
-            if(j==labelcnt)
+            j = lb_find(label+(labelcnt<<6));
+            if( j >= 0 )
+                *scriptptr = labelcode[j];
+            else
             {
                 printf("  * ERROR!(L%ld) State '%s' not found.\n",line_number,label+(labelcnt<<6));
                 error++;
@@ -555,27 +600,27 @@ char parsecommand(void)
             getlabel();
             // Check to see it's already defined
 
-            for(i=0;i<NUMKEYWORDS;i++)
-                if( strcmp( label+(labelcnt<<6),keyw[i]) == 0 )
-                {
-                    error++;
-                    printf("  * ERROR!(L%ld) Symbol '%s' is a key word.\n",line_number,label+(labelcnt<<6));
-                    return 0;
-                }
-
-            for(i=0;i<labelcnt;i++)
+            if( kw_find(label+(labelcnt<<6)) >= 0 )
             {
-                if( strcmp(label+(labelcnt<<6),label+(i<<6)) == 0 )
-                {
-                    warning++;
-                    printf("  * WARNING.(L%ld) Duplicate definition '%s' ignored.\n",line_number,label+(labelcnt<<6));
-                    break;
-                }
+                error++;
+                printf("  * ERROR!(L%ld) Symbol '%s' is a key word.\n",line_number,label+(labelcnt<<6));
+                return 0;
             }
+
+            i = lb_find(label+(labelcnt<<6));
+            if( i >= 0 )
+            {
+                warning++;
+                printf("  * WARNING.(L%ld) Duplicate definition '%s' ignored.\n",line_number,label+(labelcnt<<6));
+            }
+            else i = labelcnt;
 
             transnum();
             if(i == labelcnt)
+            {
+                lb_add(labelcnt);
                 labelcode[labelcnt++] = *(scriptptr-1);
+            }
             scriptptr -= 2;
             return 0;
         case 14:
@@ -616,23 +661,25 @@ char parsecommand(void)
                 getlabel();
                 // Check to see it's already defined
 
-                for(i=0;i<NUMKEYWORDS;i++)
-                    if( strcmp( label+(labelcnt<<6),keyw[i]) == 0 )
+                if( kw_find(label+(labelcnt<<6)) >= 0 )
                 {
                     error++;
                     printf("  * ERROR!(L%ld) Symbol '%s' is a key word.\n",line_number,label+(labelcnt<<6));
                     return 0;
                 }
 
-                for(i=0;i<labelcnt;i++)
-                    if( strcmp(label+(labelcnt<<6),label+(i<<6)) == 0 )
-                    {
-                        warning++;
-                        printf("  * WARNING.(L%ld) Duplicate move '%s' ignored.\n",line_number,label+(labelcnt<<6));
-                        break;
-                    }
+                i = lb_find(label+(labelcnt<<6));
+                if( i >= 0 )
+                {
+                    warning++;
+                    printf("  * WARNING.(L%ld) Duplicate move '%s' ignored.\n",line_number,label+(labelcnt<<6));
+                }
+                else i = labelcnt;
                 if(i == labelcnt)
+                {
+                    lb_add(labelcnt);
                     labelcode[labelcnt++] = (long) scriptptr;
+                }
                 for(j=0;j<2;j++)
                 {
                     if(keyword() >= 0) break;
@@ -763,24 +810,26 @@ char parsecommand(void)
                 scriptptr--;
                 getlabel();
 
-                for(i=0;i<NUMKEYWORDS;i++)
-                    if( strcmp( label+(labelcnt<<6),keyw[i]) == 0 )
-                    {
-                        error++;
-                        printf("  * ERROR!(L%ld) Symbol '%s' is a key word.\n",line_number,label+(labelcnt<<6));
-                        return 0;
-                    }
+                if( kw_find(label+(labelcnt<<6)) >= 0 )
+                {
+                    error++;
+                    printf("  * ERROR!(L%ld) Symbol '%s' is a key word.\n",line_number,label+(labelcnt<<6));
+                    return 0;
+                }
 
-                for(i=0;i<labelcnt;i++)
-                    if( strcmp(label+(labelcnt<<6),label+(i<<6)) == 0 )
-                    {
-                        warning++;
-                        printf("  * WARNING.(L%ld) Duplicate ai '%s' ignored.\n",line_number,label+(labelcnt<<6));
-                        break;
-                    }
+                i = lb_find(label+(labelcnt<<6));
+                if( i >= 0 )
+                {
+                    warning++;
+                    printf("  * WARNING.(L%ld) Duplicate ai '%s' ignored.\n",line_number,label+(labelcnt<<6));
+                }
+                else i = labelcnt;
 
                 if(i == labelcnt)
+                {
+                    lb_add(labelcnt);
                     labelcode[labelcnt++] = (long) scriptptr;
+                }
 
                 for(j=0;j<3;j++)
                 {
@@ -817,24 +866,26 @@ char parsecommand(void)
                 getlabel();
                 // Check to see it's already defined
 
-                for(i=0;i<NUMKEYWORDS;i++)
-                    if( strcmp( label+(labelcnt<<6),keyw[i]) == 0 )
-                    {
-                        error++;
-                        printf("  * ERROR!(L%ld) Symbol '%s' is a key word.\n",line_number,label+(labelcnt<<6));
-                        return 0;
-                    }
+                if( kw_find(label+(labelcnt<<6)) >= 0 )
+                {
+                    error++;
+                    printf("  * ERROR!(L%ld) Symbol '%s' is a key word.\n",line_number,label+(labelcnt<<6));
+                    return 0;
+                }
 
-                for(i=0;i<labelcnt;i++)
-                    if( strcmp(label+(labelcnt<<6),label+(i<<6)) == 0 )
-                    {
-                        warning++;
-                        printf("  * WARNING.(L%ld) Duplicate action '%s' ignored.\n",line_number,label+(labelcnt<<6));
-                        break;
-                    }
+                i = lb_find(label+(labelcnt<<6));
+                if( i >= 0 )
+                {
+                    warning++;
+                    printf("  * WARNING.(L%ld) Duplicate action '%s' ignored.\n",line_number,label+(labelcnt<<6));
+                }
+                else i = labelcnt;
 
                 if(i == labelcnt)
+                {
+                    lb_add(labelcnt);
                     labelcode[labelcnt++] = (long) scriptptr;
+                }
 
                 for(j=0;j<5;j++)
                 {
@@ -1426,9 +1477,39 @@ void passone(void)
 
 }
 
+#ifdef PS1_PROF
+/* PS1 debug: fingerprint of the compile result (script, labels, actor pointers; absolute script
+   addresses stored in the data are normalised to offsets) so optimisations can be proven neutral */
+static unsigned con_h;
+static void con_mix(unsigned long w)
+{
+    if( w >= (unsigned long)script && w <= (unsigned long)scriptptr ) w = 0xA5000000u | (w-(unsigned long)script);
+    con_h = (((con_h<<5)|(con_h>>27)) ^ (unsigned)w) * 0x9E3779B1u;
+}
+static void con_fingerprint(int t0)
+{
+    long i;
+    const char *s;
+    con_h = 0x811C9DC5u;
+    for(i=0;i<scriptptr-script;i++) con_mix(script[i]);
+    con_mix(labelcnt);
+    for(i=0;i<labelcnt;i++)
+    {
+        con_mix(labelcode[i]);
+        for(s=label+(i<<6);*s;s++) con_mix((unsigned char)*s);
+        con_mix(0);
+    }
+    for(i=0;i<MAXTILES;i++) con_mix(actorscrptr[i] ? (unsigned long)(actorscrptr[i]-script) : 0xFFFFFFFFu);
+    dbg("CONCRC %08x script %ld words labels %ld compile %d vsyncs (ended at vsync %d)\n",con_h,(long)(scriptptr-script),labelcnt,video_vsync_count()-t0,video_vsync_count());
+}
+#endif
+
 void loadefs(char *filenam,char *mptr)
 {
     long fs,fp;
+#ifdef PS1_PROF
+    int con_t0 = video_vsync_count();
+#endif
 
     /* PS1: CON files are always read from the CD pack (loadfromgrouponly); the "copy internal
        defaults" and "use internal defaults" prompts were removed. */
@@ -1441,7 +1522,7 @@ void loadefs(char *filenam,char *mptr)
     fs = kfilelength(fp);
 
     last_used_text = textptr = (char *) mptr;
-    last_used_size = fs;
+    last_used_size = (fs+3)&~3; /* PS1: includes load right after the main text; kread() only bulk-reads (one CD command instead of one per sector) into a 4-byte aligned buffer */
 
     kread(fp,(char *)textptr,fs);
     kclose(fp);
@@ -1453,6 +1534,8 @@ void loadefs(char *filenam,char *mptr)
 
     con_inc_done = con_tick = 0;
     labelcnt = 0;
+    memset(lb_tab,0,sizeof(lb_tab)); /* PS1: label hash index starts empty with the label list */
+    altok_init();
     scriptptr = script+1;
     warning = 0;
     error = 0;
@@ -1474,6 +1557,9 @@ void loadefs(char *filenam,char *mptr)
     {
         total_lines += line_number;
         dbg("Code Size:%ld bytes(%ld labels).\n",(long)((scriptptr-script)<<2)-4,labelcnt);
+#ifdef PS1_PROF
+        con_fingerprint(con_t0);
+#endif
     }
 }
 

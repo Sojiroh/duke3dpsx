@@ -343,6 +343,9 @@ static void predict_hit(struct weaponhit *pr, const spritetype *sp)
     pr->bposz = sp->z;
 }
 
+/* PS1: count pass progress weights (measured time per record: sector ~7, wall ~4, sprite slot ~1 units) */
+#define CNT_TOT (7*numsectors+4*numwalls+MAXSPRITES)
+
 static void xfer_state(void)
 {
     long i, j, n;
@@ -361,9 +364,17 @@ static void xfer_state(void)
         numsectors = numwalls = 0;
         return;
     }
-    for(i=0;i<numsectors;i++) sx(&sector[i],bl_rec(BL_SEC,i,tmp),sizeof(sectortype));
+    for(i=0;i<numsectors;i++)
+    {
+        if(S.mode == M_COUNT && !(i&7)) loadscreen_progress(7*i,CNT_TOT);
+        sx(&sector[i],bl_rec(BL_SEC,i,tmp),sizeof(sectortype));
+    }
     MARK("sectors");
-    for(i=0;i<numwalls;i++) sx(&wall[i],bl_rec(BL_WALL,i,tmp),sizeof(walltype));
+    for(i=0;i<numwalls;i++)
+    {
+        if(S.mode == M_COUNT && !(i&15)) loadscreen_progress(7*numsectors+4*i,CNT_TOT);
+        sx(&wall[i],bl_rec(BL_WALL,i,tmp),sizeof(walltype));
+    }
     MARK("walls");
 
     for(i=0;i<=MAXSECTORS;i++) ls_sect[i] = -1;
@@ -377,8 +388,11 @@ static void xfer_state(void)
     for(i=0;i<MAXSPRITES;i++)
     {
         spritetype *sp = &sprite[i];
-        int used = xv(rd ? 0 : sp->statnum != MAXSTATUS, i < bl_nspr, 1);
+        int used;
         short pn, pt;
+        /* PS1: count pass progress (sectors+walls+sprites work units) */
+        if(S.mode == M_COUNT && !(i&31)) loadscreen_progress(7*numsectors+4*numwalls+i,CNT_TOT);
+        used = xv(rd ? 0 : sp->statnum != MAXSTATUS, i < bl_nspr, 1);
 
         if(used)
         {

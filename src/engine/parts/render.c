@@ -5,8 +5,10 @@
  * convert runs of columns into GPU quads: walls as adaptive-width strips with
  * per-column texture u and depth-derived shading, floors/ceilings as strips
  * subdivided into depth bands so the affine interpolation stays close to the
- * true perspective mapping.  Every pixel is covered exactly once, so no depth
- * sorting is needed; primitives are drawn in emission order.
+ * true perspective mapping.  Every pixel is covered (nearly) once, so no depth
+ * sorting is needed; primitives are drawn in emission order.  Chord edges that
+ * miss the per-column boundary are hidden by EDGE_EXT (see below) and the game
+ * clears the 3D window first, so rare uncovered pixels end up black.
  */
 
 #define MAXSTRIP 32
@@ -428,6 +430,15 @@ static inline void strip_right_edge(const short *top, const short *bot, long x2,
 	if (*botR < *topR) *botR = *topR;
 }
 
+/* PS1: the GPU draws a strip's top/bottom edge as a straight chord, which differs by a pixel or two from the
+   per-column boundary the neighbouring primitive (wall vs floor/ceiling, or wall vs the sector seen through
+   a portal) follows, so 1-pixel gaps are left that keep stale framebuffer content.  Build draws front to back:
+   whatever is drawn first towards a boundary may therefore safely run EDGE_EXT pixels past it into the
+   still free rows (clamped to umost/dmost); the primitive drawn later repaints them. */
+#ifndef EDGE_EXT
+#define EDGE_EXT 4
+#endif
+
 /* The strip is drawn as one quad whose edges are the chords between its end columns.  The merge test
    only looks at second differences, which lets a polyline corner of a few degrees slip through and the
    chord then cuts off a wedge of the real top/bottom boundary.  Verify the chord against every column. */
@@ -469,7 +480,7 @@ static inline long strip_fit(const short *top, const short *bot, long x2, long x
 static void wall_spans(long x1, long x2, short *uwal, short *dwal, long *swal, long *lwal, int mode)
 {
 	long x, xa, xb, xr, tsizx, tsizy;
-	int have, trans = (mode == 2);
+	int have, trans = (mode == 2), ext_t, ext_b;
 	TexRef ref;
 	u16 clut;
 	short *clipT, *clipB;
@@ -489,6 +500,9 @@ static void wall_spans(long x1, long x2, short *uwal, short *dwal, long *swal, l
 
 	if (mode == 0) { clipT = umost; clipB = dmost; }
 	else { clipT = &startumost[windowx1]; clipB = &startdmost[windowx1]; }
+	/* PS1: edges that border rows not drawn yet: bottom of an upper wall / ceiling sky, top of a lower wall / floor sky */
+	ext_b = (mode == 0) && (dwal == dwall || dwal == uplc);
+	ext_t = (mode == 0) && (uwal == uwall || uwal == dplc);
 
 	for (x = x1; x <= x2; x++) {
 		int t = uwal[x], b = dwal[x];
@@ -498,6 +512,10 @@ static void wall_spans(long x1, long x2, short *uwal, short *dwal, long *swal, l
 		if (b > cb) b = cb;
 		if (t < 0) t = 0;
 		if (b > ydimen) b = ydimen;
+		if (t < b) {   /* PS1: run past the boundary into the free rows (see EDGE_EXT) */
+			if (ext_t) { int e = uwal[x] - EDGE_EXT; if (e < ct) e = ct; if (e < 0) e = 0; if (e < t) t = e; }
+			if (ext_b) { int e = dwal[x] + EDGE_EXT; if (e > cb) e = cb; if (e > ydimen) e = ydimen; if (e > b) b = e; }
+		}
 		top[x] = t; bot[x] = b;
 	}
 
@@ -838,6 +856,13 @@ void ceilscan(long x1, long x2, long sectnum)
 		int t = umost[x], b = min(uplc[x], dmost[x]);
 		if (t < 0) t = 0;
 		if (b > ydimen) b = ydimen;
+		if (t < b) {   /* PS1: ceiling's bottom edge runs down into the wall rows drawn after it (see EDGE_EXT); stay above the horizon */
+			int e = uplc[x] + EDGE_EXT, h = max(b, globalhoriz);
+			if (e > dmost[x]) e = dmost[x];
+			if (e > h) e = h;
+			if (e > ydimen) e = ydimen;
+			if (e > b) b = e;
+		}
 		top[x] = t; bot[x] = b;
 	}
 	{ PROF_BEGIN(t); plane_spans(x1, x2, top, bot, (globalorientation & 0x180) >= 256); PROF_END(prof_plane, t); PROF_COUNT(prof_nplane, 1); }
@@ -869,6 +894,13 @@ void florscan(long x1, long x2, long sectnum)
 		int t = max(dplc[x], umost[x]), b = dmost[x];
 		if (t < 0) t = 0;
 		if (b > ydimen) b = ydimen;
+		if (t < b) {   /* PS1: floor's top edge runs up into the wall rows drawn after it (see EDGE_EXT); stay below the horizon */
+			int e = dplc[x] - EDGE_EXT, h = min(t, globalhoriz + 1);
+			if (e < umost[x]) e = umost[x];
+			if (e < h) e = h;
+			if (e < 0) e = 0;
+			if (e < t) t = e;
+		}
 		top[x] = t; bot[x] = b;
 	}
 	{ PROF_BEGIN(t); plane_spans(x1, x2, top, bot, (globalorientation & 0x180) >= 256); PROF_END(prof_plane, t); PROF_COUNT(prof_nplane, 1); }
@@ -1012,6 +1044,11 @@ void grouscan(long dax1, long dax2, long sectnum, char dastat)
 		else { t = max(umost[x],dplc[x]); b = dmost[x]; }
 		if (t < 0) t = 0;
 		if (b > ydimen) b = ydimen;
+		if (t < b) {   /* PS1: run past the wall boundary into the free rows (see EDGE_EXT) */
+			int e;
+			if (dastat == 0) { e = uplc[x] + EDGE_EXT; if (e > dmost[x]) e = dmost[x]; if (e > ydimen) e = ydimen; if (e > b) b = e; }
+			else { e = dplc[x] - EDGE_EXT; if (e < umost[x]) e = umost[x]; if (e < 0) e = 0; if (e < t) t = e; }
+		}
 		top[x] = t; bot[x] = b;
 	}
 	plane_spans(dax1, dax2, top, bot, 0);
