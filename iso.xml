@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<iso_project>
+	<track type="data">
+		<identifiers
+			system="PLAYSTATION" volume="DUKE3D" volume_set="DUKE3D"
+			publisher="DUKE3DPS1" data_preparer="PSN00BSDK ${PSN00BSDK_VERSION}"
+			application="PLAYSTATION" copyright="README.TXT;1" />
+		<directory_tree>
+			<file name="SYSTEM.CNF" type="data" source="${PROJECT_SOURCE_DIR}/system.cnf" />
+			<file name="DUKE3D.EXE" type="data" source="duke3d.exe" />
+			<file name="DUKE.DAT"   type="data" source="data/DUKE.DAT" />
+			<dummy sectors="1024"/>
+		</directory_tree>
+	</track>
+</iso_project>

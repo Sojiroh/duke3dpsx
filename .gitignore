@@ -1,0 +1,9 @@
+build*/
+tools/dl/
+tools/gcc/
+tools/sdk/
+tools/redux/
+upstream/
+shots/
+__pycache__/
+*.mcd
