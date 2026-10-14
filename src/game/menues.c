@@ -26,6 +26,7 @@ Prepared for public release: 03/21/2003 - Charlie Wiederhold, 3D Realms
 
 #pragma GCC optimize ("Os") /* PS1: cold code, keep the executable small */
 #include "duke3d.h"
+#include "loadscreen.h"
 #include "mouse.h"
 #include "animlib.h"
 #include "palette.h"
@@ -148,6 +149,12 @@ void getangplayers(short snum)
    (de)serialisation is in sg_write()/sg_read(); the post-load fixups below are the original ones. */
 #include "savegame.h"
 
+/* PS1: loading screen: percentage at the end of each stage of loadplayer() (see loadscreen.c); measured
+   (vsyncs): flush + art 22, card read + map 764, cacheit 1, tile preload 262, music 12 */
+#define LS_LOAD_CARD    72
+#define LS_LOAD_CACHEIT 73
+#define LS_LOAD_TILES   98
+
 int loadpheader(char spot,int32 *vn,int32 *ln,int32 *psk,int32 *nump)
 {
     sg_info in;
@@ -179,7 +186,20 @@ int loadplayer(signed char spot)
     music_changed = (music_select != (ud.volume_number*11) + ud.level_number);
 
     ingame = (ps[myconnectindex].gm&MODE_GAME) != 0;   /* before sg_read: a decode overwrites ps[].gm */
+
+    /* PS1: loading screen for the card read and the tile preload.  The cache is flushed first (as
+       enterlevel() does): the preload budget is relative to what stays resident (fonts, loading art) and
+       no streaming read is in flight while the screen is redrawn. */
+    {
+        extern void video_wait_gpu(void);
+        extern void tex_flush(void);
+        video_wait_gpu();
+        tex_flush();
+    }
+    loadscreen_begin("LOADING",NULL,1);
+    loadscreen_stage(LS_LOAD_CARD,0);
     rc = sg_read(spot);
+    if(rc != 0) loadscreen_end();
     if(rc == SG_DESTROYED)
     {
         /* PS1: the decode failed after the world and players were overwritten (ud.volume/level/skill
@@ -238,9 +258,13 @@ int loadplayer(signed char spot)
 
     clearbufbyte(gotpic,sizeof(gotpic),0L);
     clearsoundlocks();
+    loadscreen_text("ENTERING",level_names[(ud.volume_number*11) + ud.level_number]);
+    loadscreen_stage(LS_LOAD_CACHEIT,0);
     cacheit();
+    loadscreen_stage(LS_LOAD_TILES,0);   /* docacheit() reports its own progress */
     docacheit();
 
+    loadscreen_stage(100,0);
     if(music_changed == 0)
         music_select = (ud.volume_number*11) + ud.level_number;
     playmusic(&music_fn[0][music_select][0]);
@@ -334,6 +358,8 @@ int loadplayer(signed char spot)
     waitforeverybody();
 
     resettimevars();
+
+    loadscreen_end();
 
     return(0);
 }
@@ -1660,6 +1686,7 @@ void menus(void)
 
                 newgame(ud.m_volume_number,ud.m_level_number,ud.m_player_skill);
                 enterlevel(MODE_GAME);
+                return;      /* PS1: the skill list below would be drawn over the loading screen left for the first frame */
             }
             else if(x == -1)
             {
@@ -1885,8 +1912,7 @@ void menus(void)
                     if( ud.savegame[x][0] == 0 ) strcpy(&ud.savegame[x][0],"SAVED GAME");
                 }
 
-                menutext(c,100,0,0,"SAVING...");
-                nextpage();
+                loadscreen_begin("SAVING",NULL,0);   /* PS1: with a progress bar; ends below */
 
                 /* back to the game either way: on a failure saveplayer() leaves the reason in an FTA message,
                    which is only visible outside the menu */
@@ -1895,6 +1921,7 @@ void menus(void)
                     lastsavedpos = x;
                     sound(EXITMENUSOUND);
                 }
+                loadscreen_end();
                 ps[myconnectindex].gm = MODE_GAME;
 
                 if(ud.multimode < 2  && ud.recstat != 2)

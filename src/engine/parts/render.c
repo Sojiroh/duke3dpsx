@@ -1136,7 +1136,8 @@ static void dorotatesprite(long sx, long sy, long z, short a, short picnum, sign
 
 /* ---- misc 2D ----------------------------------------------------------- */
 
-static void fill_rect(long x1, long y1, long x2, long y2, long dacol)
+/* PS1: flat palette-colour rectangle (inclusive corners); also draws the loading screen progress bar */
+void rend_fillrect(long x1, long y1, long x2, long y2, long dacol)
 {
 	TILE *t;
 	rend_2d();
@@ -1151,12 +1152,12 @@ static void fill_rect(long x1, long y1, long x2, long y2, long dacol)
 
 void clearview(long dacol)
 {
-	fill_rect(windowx1, windowy1, windowx2, windowy2, dacol);
+	rend_fillrect(windowx1, windowy1, windowx2, windowy2, dacol);
 }
 
 void clearallviews(long dacol)
 {
-	fill_rect(0, 0, xdim - 1, ydim - 1, dacol);
+	rend_fillrect(0, 0, xdim - 1, ydim - 1, dacol);
 }
 
 /* Lines are clipped to the 3D window here: the GPU drops primitives whose vertices are more than 1023

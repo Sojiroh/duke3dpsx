@@ -310,14 +310,15 @@ void nextpage(void)
 long loadpics(char *filename)
 {
 	const PakEntry *e = pak_find("TILEIDX");
-	static unsigned char buf[2048] __attribute__((aligned(4)));
+	unsigned char *buf = tex_staging();   /* 64 KB, unused until tex_init(): one bulk read instead of 32 seeks */
 	long i, k;
 	if (!e) fatal("TILEIDX missing");
+	if (MAXTILES * 16 > 65536) fatal("TILEIDX larger than the staging buffer");
 	numtiles = MAXTILES;
+	if (pak_read(e->sector, (MAXTILES * 16) / 2048, buf) < 0) fatal("TILEIDX read failed");
 	for (k = 0; k < MAXTILES; k += 128) {
-		pak_read(e->sector + (k * 16) / 2048, 1, buf);
 		for (i = 0; i < 128; i++) {
-			unsigned char *r = buf + i * 16;
+			unsigned char *r = buf + (k + i) * 16;
 			long t = k + i;
 			tilesizx[t] = r[0] | (r[1]<<8);
 			tilesizy[t] = r[2] | (r[3]<<8);

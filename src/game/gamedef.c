@@ -26,6 +26,8 @@ Prepared for public release: 03/21/2003 - Charlie Wiederhold, 3D Realms
 
 #pragma GCC optimize ("Os") /* PS1: cold code, keep the executable small */
 #include "duke3d.h"
+#include "loadscreen.h"
+#include "data_index.h"
 
 extern short otherp;
 
@@ -33,6 +35,16 @@ static short total_lines,line_number;
 static char checking_ifelse,parsing_state,*last_used_text;
 static short num_squigilly_brackets;
 static long last_used_size;
+
+/* PS1: loading screen progress of the CON compile (CPU bound: ~16 s): source bytes consumed so far = the
+   position in GAME.CON + the included files already compiled + the position inside the current include */
+static long con_main_pos, con_inc_done, con_tick;
+static void con_progress(void)
+{
+    char *inc = last_used_text+last_used_size;
+    long pos = textptr >= inc ? con_main_pos+con_inc_done+(textptr-inc) : (textptr-last_used_text)+con_inc_done;
+    loadscreen_progress(pos,DAT_GAME_CON_SIZE+DAT_USER_CON_SIZE+DAT_DEFS_CON_SIZE);
+}
 
 static short g_i,g_p;
 static long g_x;
@@ -444,6 +456,8 @@ char parsecommand(void)
 
     if( error > 12 || ( *textptr == '\0' ) || ( *(textptr+1) == '\0' ) ) return 1;
 
+    if( (++con_tick & 63) == 0 ) con_progress();
+
     tw = transword();
 
     switch(tw)
@@ -722,6 +736,7 @@ char parsecommand(void)
             temp_ifelse_check = checking_ifelse;
             checking_ifelse = 0;
             origtptr = textptr;
+            con_main_pos = origtptr-last_used_text;
             textptr = last_used_text+last_used_size;
 
             *(textptr+j) = 0;
@@ -734,6 +749,7 @@ char parsecommand(void)
             while( done == 0 );
 
             textptr = origtptr;
+            con_inc_done += j;
             total_lines += line_number;
             line_number = temp_line_number;
             checking_ifelse = temp_ifelse_check;
@@ -1435,6 +1451,7 @@ void loadefs(char *filenam,char *mptr)
     clearbuf(actorscrptr,MAXTILES,0L); /* PS1: was MAXSPRITES, but actorscrptr/actortype are MAXTILES entries */
     clearbufbyte(actortype,MAXTILES,0L);
 
+    con_inc_done = con_tick = 0;
     labelcnt = 0;
     scriptptr = script+1;
     warning = 0;

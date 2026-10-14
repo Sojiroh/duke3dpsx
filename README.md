@@ -144,7 +144,8 @@ Menus and screens:
   `texcache.c` (VRAM texture cache with CD streaming), `palette.c` (CLUT cache, shading, tint).
 - `src/game/`: ported game code. `game.c` (`duke_main`), `ps1_control.c` (pad to input
   mapping), `ps1_platform.c` (network, timer and cache stubs), `sounds.c`, `menues.c`,
-  `savegame.c` (save game state coding, see Technical notes), and the rest of the game logic.
+  `savegame.c` (save game state coding, see Technical notes), `loadscreen.c` (loading screen with a
+  progress bar, see Technical notes), and the rest of the game logic.
 - `tools/`: build and test tools.
   - `mkdata.py` builds `DUKE.DAT` and `data_index.h` from the GRP (tiles, palettes, maps,
     CON scripts, sounds as SPU-ADPCM, music).
@@ -247,6 +248,20 @@ Loading E1L1 takes about 2000 vsyncs.
   many seconds in game, perturbs the state, saves again (safe replace), perturbs again, loads and
   prints state checksums (`SAVETEST ...` lines); `-DPS1_SAVETEST_LOADONLY=1` only loads slot 0;
   `-DPS1_SAVETEST_KEEPOLD=1` skips erasing the old copy (simulates an interrupted save).
+- **Loading screen** (`src/game/loadscreen.c`): the boot (~1400 vsyncs after the screen comes up, 70%
+  of it compiling the CON files), the level loads, loading a saved game and saving show the game's
+  own big red `menutext()` letters (on black, or on the `LOADSCREEN` art for levels) and a progress
+  bar drawn with flat palette colours (`rend_fillrect()`). The bar is a list of stages
+  (`loadscreen_stage(end_pct, expected_bytes)`), each ending at a percentage proportional to its
+  measured duration. While a stage runs the bar follows the CD bytes read by `pak_read()` (the
+  `pak_progress` hook; boot stages), or the stage reports itself with `loadscreen_progress()` (CON
+  compile by source position, the tile preload, card read/write). A redraw presents one frame
+  (`nextpage()`) and only happens every 2 percent (it costs about half a vsync of waiting); it only draws tiles that are resident
+  (fonts and `LOADSCREEN` are locked in the texture cache; `tex_flush()` keeps locked tiles, so a
+  level load no longer re-reads the fonts), and `loadscreen_begin()` drains the streaming queue
+  (`tex_quiesce()`) so no streaming read runs while the screen is up. Debug: with `-DPS1_PROF` every
+  stage prints its duration and CD bytes (`LS: stage -> N% took V vsyncs, B CD bytes`), which is what
+  the percentages in `game.c`, `premap.c`, `menues.c` and `savegame.c` were derived from.
 - **Memory**: the console has 2 MB of RAM. The SDK heap (`InitHeap` at `_end`, a few KB used by
   `CdSearchFile`) and the stack share the space above `.bss`. `build.sh` enforces that the end of
   `.bss` (`_end`) stays at or below 0x801F8000, keeping 32 KB for them (it prints

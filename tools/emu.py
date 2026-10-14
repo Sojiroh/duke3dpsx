@@ -203,6 +203,10 @@ def raw_to_png(outdir, name):
     if not os.path.exists(meta):
         return False
     w, h = map(int, open(meta).read().split())
+    if w == 0 or h == 0:  # display not enabled yet: nothing to convert
+        os.remove(meta); os.remove(os.path.join(outdir, name + ".raw"))
+        print("SHOT %s: display off, skipped" % name)
+        return False
     raw = np.fromfile(os.path.join(outdir, name + ".raw"), dtype=np.uint8)
     if len(raw) == w * h * 2:
         px = raw.view(np.uint16).reshape(h, w)

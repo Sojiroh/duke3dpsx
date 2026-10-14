@@ -59,6 +59,9 @@ int pak_read(u32 sector, int nsectors, void *dst);           /* synchronous, dst
    cancelled and the drive is free again).  Returns 0 if the drive is busy or the read could not be started
    (done is not called then). */
 int pak_read_async(u32 sector, int nsectors, void *dst, void (*done)(int ok));
+/* PS1: optional main-thread progress hook (loading screen): called by the synchronous pak_read() after each
+   successful read with the number of bytes read.  NULL when unused. */
+extern void (*pak_progress)(unsigned long bytes);
 int pak_busy(void);
 void pak_tick(void);                /* vblank IRQ: async read timeout watchdog */
 int pak_read_bytes(const PakEntry *e, u32 offset, void *dst, u32 len); /* synchronous, arbitrary byte ranges via bounce */

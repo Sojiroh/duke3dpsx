@@ -18,6 +18,7 @@ extern CdlCB _cd_override_callback;       /* cdrom.c: CdRead()'s sector callback
 #define ASYNC_TIMEOUT 120
 #define PAUSE_TIMEOUT 90      /* vblanks to wait for the CdlPause that ends a read before sending another */
 static u32 bounce[2048 / 4];
+void (*pak_progress)(unsigned long bytes);   /* see psx.h */
 
 int pak_init(void)
 {
@@ -86,7 +87,10 @@ int pak_read(u32 sector, int nsectors, void *dst)
 	for (int attempt = 0; attempt < 4; attempt++) {
 		if (!CdControl(CdlSetloc, &loc, 0)) continue;
 		if (!CdRead(nsectors, (u32 *)dst, CdlModeSpeed)) continue;
-		if (CdReadSync(0, 0) == 0) return 0;
+		if (CdReadSync(0, 0) == 0) {
+			if (pak_progress) pak_progress((unsigned long)nsectors * 2048);
+			return 0;
+		}
 	}
 	return -1;
 }

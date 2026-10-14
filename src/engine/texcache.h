@@ -16,6 +16,7 @@ typedef struct {
 } TexRef;
 
 void tex_init(void);
+void *tex_staging(void);                              /* 64 KB CD staging buffer (free to borrow before tex_init) */
 int tex_lookup(int picnum, int piece, TexRef *out);   /* 1 = resident (marks LRU); 0 = not (queues a load) */
 int tex_npieces(int picnum);
 int tex_lookup_sync(int picnum, int piece, TexRef *out);  /* like tex_lookup but loads synchronously on a miss */
@@ -24,7 +25,8 @@ void tex_preload_range(int first, int last, int lock);  /* single-piece tiles, b
 u32 tex_sector(int picnum);                             /* CD sector of the tile (preload ordering) */
 int tex_vram_pct(void);                                /* % of cache VRAM in use */
 void tex_frame(void);                                 /* call once per frame (LRU tick + streaming pump) */
-void tex_flush(void);                                 /* evict everything */
+void tex_quiesce(void);                               /* finish the in-flight streaming read, drop the queue (no new CD reads until a 3D frame) */
+void tex_flush(void);                                 /* evict everything except locked tiles */
 void tex_lock(int picnum, int lock);                  /* keep resident (HUD etc.) */
 extern int tex_stat_resident, tex_stat_misses, tex_stat_loads, tex_stat_half;   /* half = resident half-res tiles */
 int tex_active_pct(void);                            /* % of cache VRAM used by the recent working set (half-res decision) */

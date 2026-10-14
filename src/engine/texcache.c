@@ -145,6 +145,7 @@ static u16 queue[QLEN];
 static int qhead, qtail;
 static u8 pendingbit[(MAXTILES + 7) >> 3];
 static u32 staging[65536 / 4];
+void *tex_staging(void) { return staging; }
 static volatile int cd_done;
 static int inflight_slot = -1;
 static int inflight_stride, inflight_h;
@@ -458,17 +459,28 @@ void tex_frame(void)
 	texframe++;
 }
 
-void tex_flush(void)
+/* PS1: finish the in-flight streaming read and drop the queued tiles, so that nothing touches the CD or
+   the staging buffer until a 3D frame asks for tiles again (loading screens, memory card access). */
+void tex_quiesce(void)
 {
-	int s;
 	while (!inflight_finish()) ;
-	for (s = 0; s < MAXSLOTS; s++) if (slots[s].state) evict_slot(s);
 	qhead = qtail = 0;
 	memset(pendingbit, 0, sizeof(pendingbit));
 }
 
+void tex_flush(void)
+{
+	int s;
+	tex_quiesce();
+	/* PS1: locked slots (fonts, the loading screen art) survive: the level loader keeps drawing them */
+	for (s = 0; s < MAXSLOTS; s++) if (slots[s].state && !slots[s].lock) evict_slot(s);
+}
+
 void tex_lock(int picnum, int lock)
 {
-	int s = find_slot(picnum, 0);
-	if (s >= 0) slots[s].lock = lock;
+	int p, np = tilenpieces[picnum] ? tilenpieces[picnum] : 1;
+	for (p = 0; p < np; p++) {   /* PS1: every piece of a multi-piece tile (the loading screen art) */
+		int s = find_slot(picnum, p);
+		if (s >= 0) slots[s].lock = lock;
+	}
 }

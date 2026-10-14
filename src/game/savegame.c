@@ -37,10 +37,16 @@
 #include "kfile.h"
 #include "memcard.h"
 #include "savegame.h"
+#include "loadscreen.h"
 
 #define SG_MAGIC "DK3D"
 #define SG_FMT   1
 #define META_BYTES 128
+
+/* PS1: saving screen: percentage at the end of each pass of sg_write() (see loadscreen.c); measured
+   (vsyncs): count pass 251, card write 581, read back 287 */
+#define LS_SAVE_COUNT 22
+#define LS_SAVE_WRITE 73
 
 const char *sg_error = "";
 
@@ -83,12 +89,17 @@ static int nmarks;
 #define MARK(n)
 #endif
 
+/* PS1: loading / saving screen (loadscreen.c): progress of the current stage = (pg_off + position in the
+   pass) / pg_tot; pg_len is the payload length of the pass being decoded.  No-ops without a loading screen. */
+static unsigned long pg_off, pg_tot, pg_len;
+
 static void obflush(void)
 {
     if(S.bn)
     {
         if(mc_write(S.buf,S.bn) < 0) S.err = 1;
         S.bn = 0;
+        loadscreen_progress(S.len,pg_tot);
     }
 }
 
@@ -155,6 +166,7 @@ static unsigned char getb(void)
         S.inleft -= n;
         S.il = n;
         S.ip = 0;
+        loadscreen_progress(pg_off+pg_len-S.inleft,pg_tot);
     }
     return S.buf[S.ip++];
 }
@@ -611,6 +623,7 @@ static int verify_payload(const meta *m)
         if(mc_read(c,k) < 0) return -1;
         for(i=0;i<k;i++) sum = (sum ^ c[i]) * 16777619u;
         n -= k;
+        loadscreen_progress(pg_off+m->len-n,pg_tot);
     }
     return sum == m->sum ? 0 : -2;
 }
@@ -710,6 +723,7 @@ int sg_write(int spot)
 
     bl_open(ud.volume_number,ud.level_number,m.flags&1);
 
+    loadscreen_stage(LS_SAVE_COUNT,0);   /* the saving screen: pass 1 (count), pass 2 (card write), read back */
     codec_reset(M_COUNT);
 #ifdef PS1_SAVETEST
     nmarks = 0;
@@ -763,6 +777,8 @@ int sg_write(int spot)
         return -1;
     }
     mc_write(&m,sizeof(m));
+    loadscreen_stage(LS_SAVE_WRITE,0);
+    pg_tot = len1;
     codec_reset(M_WRITE);
     xfer_state();
     enc_end();
@@ -773,6 +789,8 @@ int sg_write(int spot)
     /* read the new file back (meta + payload checksum) before the old copy may go */
     if(ok)
     {
+        loadscreen_stage(100,0);
+        pg_off = 0; pg_tot = m.len;
         ok = open_meta(spot,target,&v) == 0;
         if(ok)
         {
@@ -822,6 +840,7 @@ int sg_read(int spot)
     if(m.info.nump != numplayers) { mc_read_close(); return 2; }
 
     /* pass 1: verify the payload checksum without touching the game state */
+    pg_off = 0; pg_tot = 2*m.len;       /* the loading screen bar covers both passes */
     rc = verify_payload(&m);
     mc_read_close();
     if(rc == -1) { sg_error = "CARD READ ERROR"; return -1; }
@@ -829,6 +848,7 @@ int sg_read(int spot)
 
     /* pass 2: decode */
     if(open_meta(spot,cur_alt1[spot]-1,&m) < 0) return -1;
+    pg_off = pg_len = m.len;
     /* PS1: ud.volume/level/skill and the slot name are committed only after a successful decode */
     /* the player list (connecthead/connectpoint2) is part of the decoded stream; a failed decode leaves
        garbage there (e.g. connectpoint2[0] = 0 loops enterlevel forever), so keep the live values */

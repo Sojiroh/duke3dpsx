@@ -25,6 +25,7 @@ Prepared for public release: 03/21/2003 - Charlie Wiederhold, 3D Realms
 //-------------------------------------------------------------------------
 
 #include "duke3d.h"
+#include "loadscreen.h"
 
 extern char everyothertime;
 short which_palookup = 9;
@@ -42,6 +43,15 @@ void cachespritenum(short i)
     if(ud.monsters_off && badguy(&sprite[i])) return;
     tloadtile(PN);
 }
+
+/* PS1: loading screen: percentage at the end of each stage of enterlevel() (see loadscreen.c); measured for
+   E1L1 (vsyncs): map 104, fonts 1, prelevel 5, cacheit 14..73 (varies with the CD head position), tile preload
+   180, music 12 */
+#define LS_LVL_BOARD    29
+#define LS_LVL_FONTS    29
+#define LS_LVL_PRELEVEL 30
+#define LS_LVL_CACHEIT  44
+#define LS_LVL_TILES    96
 
 extern void tex_flush(void);
 extern void tex_preload_range(int first, int last, int lock);
@@ -137,7 +147,7 @@ void cacheit(void)
 
 extern u32 tex_sector(int picnum);
 extern int tex_vram_pct(void);
-#define PRELOAD_VRAM_PCT 45
+#define PRELOAD_BUDGET_PCT 39   /* % of VRAM the preload may add (was: up to 45% in total, with the 6% fonts resident) */
 #define PRELOAD_MAX 400
 
 void docacheit(void)
@@ -147,6 +157,9 @@ void docacheit(void)
     static short list[PRELOAD_MAX];
     long i, j, n = 0, k;
     u32 key;
+    /* PS1: callers flush the cache first, so what is resident is locked (fonts, loading screen art) and the
+       budget is relative to it */
+    int base = tex_vram_pct(), cap = base + PRELOAD_BUDGET_PCT, pct;
 
     for(i=0;i<MAXTILES && n<PRELOAD_MAX;i++)
         if( (gotpic[i>>3]&(1<<(i&7))) && tilesizx[i] > 0 && tilesizy[i] > 0)
@@ -163,10 +176,16 @@ void docacheit(void)
 
     for(i=0;i<n;i++)
     {
-        if(tex_vram_pct() >= PRELOAD_VRAM_PCT) break;
+        if(tex_vram_pct() >= cap) break;
         loadtile(list[i]);
+        /* PS1: loading screen: the preload ends when the list or the VRAM budget runs out, whichever is
+           nearer; the bar follows the larger of the two fractions */
+        pct = (int)((i+1)*100/n);
+        k = cap > base ? (tex_vram_pct()-base)*100/(cap-base) : 100;
+        loadscreen_progress(k > pct ? k : pct,100);
         if((i&7) == 7) getpackets();
     }
+    loadscreen_progress(1,1);
     dbg("docacheit: %ld tiles requested, vram %d%%\n", n, tex_vram_pct());
 
     clearbufbyte(gotpic,sizeof(gotpic),0L);
@@ -1112,22 +1131,13 @@ void dofrontscreens(void)
         vscrn();
         clearview(0L);
 
-        rotatesprite(320<<15,200<<15,65536L,0,LOADSCREEN,0,0,2+8+64,0,0,xdim-1,ydim-1);
-
+        /* PS1: the loading screen (LOADSCREEN art, text, progress bar; see loadscreen.c) ends in enterlevel() */
         if( boardfilename[0] != 0 && ud.level_number == 7 && ud.volume_number == 0 )
-        {
-            menutext(160,90,0,0,"ENTERING USER MAP");
-            gametextpal(160,90+10,boardfilename,14,2);
-        }
+            loadscreen_begin("ENTERING USER MAP",boardfilename,1);
         else
-        {
-            menutext(160,90,0,0,"ENTERING");
-            menutext(160,90+16+8,0,0,level_names[(ud.volume_number*11) + ud.level_number]);
-        }
+            loadscreen_begin("ENTERING",level_names[(ud.volume_number*11) + ud.level_number],1);
 
-        nextpage();
-
-        for(j=63;j>0;j-=7) palto(0,0,0,j);
+        for(j=63;j>=0;j-=7) palto(0,0,0,j);   /* PS1: ends at 0 so that the bar is drawn at full brightness */
 
         KB_FlushKeyboardQueue();
         ud.screen_size = i;
@@ -1137,9 +1147,7 @@ void dofrontscreens(void)
         clearview(0L);
         ps[myconnectindex].palette = palette;
         palto(0,0,0,0);
-        rotatesprite(320<<15,200<<15,65536L,0,LOADSCREEN,0,0,2+8+64,0,0,xdim-1,ydim-1);
-        menutext(160,105,0,0,"LOADING...");
-        nextpage();
+        loadscreen_begin("LOADING",NULL,1);
     }
 }
 
@@ -1212,6 +1220,8 @@ void enterlevel(char g)
     vscrn();
     ud.screen_size = i;
 
+    loadscreen_stage(LS_LVL_BOARD,0);   /* PS1: the map read */
+
 #ifndef VOLUMEONE
 
     if( boardfilename[0] != 0 && ud.m_level_number == 7 && ud.m_volume_number == 0 )
@@ -1246,10 +1256,12 @@ void enterlevel(char g)
 
     /* new level: drop the previous level's tiles from the VRAM cache (the preload below budgets a
        fraction of an empty cache) */
+    loadscreen_stage(LS_LVL_FONTS,0);
     video_wait_gpu();
-    tex_flush();
+    tex_flush();        /* PS1: keeps the locked fonts and loading screen art, so the next line reads nothing */
     cachefonts();
 
+    loadscreen_stage(LS_LVL_PRELEVEL,0);
     prelevel(g);
 
     allignwarpelevators();
@@ -1273,9 +1285,12 @@ void enterlevel(char g)
 
     if(ud.recstat != 2) MUSIC_StopSong();
 
+    loadscreen_stage(LS_LVL_CACHEIT,0);
     cacheit();
+    loadscreen_stage(LS_LVL_TILES,0);   /* docacheit() reports its own progress */
     docacheit();
 
+    loadscreen_stage(100,0);
     if(ud.recstat != 2)
     {
         music_select = (ud.volume_number*11) + ud.level_number;
@@ -1348,6 +1363,8 @@ void enterlevel(char g)
      clearfrags();
 
      resettimevars();  // Here we go
+
+     loadscreen_end();   /* PS1: the 100% frame stays up until the first game frame */
 
 
 }

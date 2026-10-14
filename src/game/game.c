@@ -37,6 +37,8 @@ Prepared for public release: 03/21/2003 - Charlie Wiederhold, 3D Realms
 #include "config.h"
 
 #include "duke3d.h"
+#include "loadscreen.h"
+#include "data_index.h"
 #include <setjmp.h>
 #include "palette.h"
 
@@ -6176,6 +6178,16 @@ static char sixteen[] = "16 Possible Dukes";
 ===================
 */
 
+/* PS1: loading screen: percentage at the end of each boot stage, proportional to the measured duration
+   (vsyncs: tile index 146, fonts 147, CON compile 1003, memory card 8, music bank 76, lookups 26) */
+#define LS_BOOT_PICS    10
+#define LS_BOOT_FONTS   21
+#define LS_BOOT_CON     92
+#define LS_BOOT_SAVES   93
+#define LS_BOOT_MUSIC   98
+#define LS_BOOT_LOOKUPS 99
+#define LS_FONT_BYTES   518144   /* CD bytes cachefonts() reads (measured) */
+
 void compilecons(void)
 {
    mymembuf = (char *)&hittype[0];
@@ -6192,8 +6204,6 @@ void Startup(void)
 
    KB_Startup();
 
-   compilecons();
-
    CONFIG_ReadSetup();
 
    CONTROL_Startup( ControllerType, &GetTime, TICRATE );
@@ -6201,9 +6211,24 @@ void Startup(void)
    initengine();
    inittimer();
 
+   /* PS1: the boot takes ~25 s, so the loading screen comes up as soon as the video mode and the palette
+      exist.  compilecons() only uses wall[]/sector[]/hittype[] as scratch and nothing below depends on
+      the CON state, so the engine, tile index and fonts are brought up first. */
+   setgamemode(ScreenMode,ScreenWidth,ScreenHeight);
+   loadscreen_begin(NULL,NULL,0);               /* bar only until the fonts are resident */
+
    dbg("Loading art header.\n");
+   loadscreen_stage(LS_BOOT_PICS,DAT_TILEIDX_SIZE);
    loadpics("tiles000.art");
 
+   loadscreen_stage(LS_BOOT_FONTS,LS_FONT_BYTES);
+   { extern void cachefonts(void); cachefonts(); }
+   loadscreen_text("LOADING",NULL);
+
+   loadscreen_stage(LS_BOOT_CON,0);             /* compilecons() reports its own progress */
+   compilecons();
+
+   loadscreen_stage(LS_BOOT_SAVES,0);           /* memory card, not CD bytes */
    readsavenames();
 
    tilesizx[MIRROR] = tilesizy[MIRROR] = 0;
@@ -6217,6 +6242,7 @@ void Startup(void)
    if(networkmode == 255)
        networkmode = 1;
 
+   loadscreen_stage(LS_BOOT_MUSIC,DAT_MUSBANK_SIZE);
    MusicStartup();
    SoundStartup();
    loadtmb();
@@ -6281,13 +6307,10 @@ int duke_main(void)
 
     dbg("Loading palette/lookups.\n");
 
-    setgamemode(ScreenMode,ScreenWidth,ScreenHeight);
-
+    loadscreen_stage(LS_BOOT_LOOKUPS,DAT_LOOKUP_DAT_SIZE);
     genspriteremaps();
 
     setbrightness(ud.brightness>>2,&ps[myconnectindex].palette[0]);
-
-    { extern void cachefonts(void); cachefonts(); }
 
     FX_StopAllSounds();
     clearsoundlocks();
@@ -6297,6 +6320,7 @@ int duke_main(void)
     if(setjmp(ps1_restart))
     {
         kcloseall();
+        loadscreen_end();    /* a gameexit() during a level load leaves the loading screen active */
         ps1_inframe = 0;     /* quit is reached through menus() inside displayrest, with ps1_inframe set */
         ud.warp_on = 0;
         ud.eog = 0;
@@ -6308,6 +6332,8 @@ int duke_main(void)
     }
 
     MAIN_LOOP_RESTART:
+
+    loadscreen_end();    /* the last frame stays up until Logo() draws its first one */
 
     if(ud.warp_on == 0)
         Logo();

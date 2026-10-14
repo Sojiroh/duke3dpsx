@@ -176,6 +176,7 @@ void setview(long x1, long y1, long x2, long y2);
 void setaspect(long daxrange, long daaspect);
 void clearview(long dacol);
 void clearallviews(long dacol);
+void rend_fillrect(long x1, long y1, long x2, long y2, long palindex);   /* PS1: flat rectangle, inclusive corners */
 void setbrightness(char dabrightness, char *dapal);
 void makepalookup(long palnum, char *remapbuf, signed char r, signed char g, signed char b, char dastat);
 long getclosestcol(long r, long g, long b);

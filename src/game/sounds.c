@@ -51,7 +51,9 @@ static fx_sample sfxdesc[NUM_SOUNDS];
 static unsigned char sfxstate[NUM_SOUNDS];  /* 0 not registered, 1 registered, 2 missing in DUKE.DAT */
 
 /* PS1: look the sound up in the pack and fill its descriptor. Returns 1 if the sample exists. */
-static int sound_register(unsigned short num)
+/* quiet=1: level precache (the original getsound() returned silently for missing files; the v1.3D
+   GRP lacks 14 sounds its own USER.CON names, e.g. VPISS2.VOC). The message is kept for play time. */
+static int sound_register2(unsigned short num, int quiet)
 {
     char name[16];
     const PakEntry *e;
@@ -69,8 +71,11 @@ static int sound_register(unsigned short num)
     if(e == NULL)
     {
         sfxstate[num] = 2;
-        sprintf(&fta_quotes[113][0],"Sound %s(#%ld) not found.",sounds[num],(long)num);
-        FTA(113,&ps[myconnectindex]);
+        if(!quiet)
+        {
+            sprintf(&fta_quotes[113][0],"Sound %s(#%ld) not found.",sounds[num],(long)num);
+            FTA(113,&ps[myconnectindex]);
+        }
         return 0;
     }
 
@@ -297,12 +302,14 @@ void playmusic(char *fn)
    are preloaded into SPU RAM while the cache is mostly empty; everything else loads on first play. */
 #define PRELOAD_BUDGET (32*1024)
 
+static int sound_register(unsigned short num) { return sound_register2(num, 0); }
+
 char getsound(unsigned short num)
 {
     if(num >= NUM_SOUNDS || SoundToggle == 0) return 0;
     if (FXDevice == NumSoundCards) return 0;
 
-    if( sound_register(num) == 0 ) return 0;
+    if( sound_register2(num, 1) == 0 ) return 0;
 
     if( ( (ud.level_number == 0 && ud.volume_number == 0 && (num == 189 || num == 232 || num == 99 || num == 233 || num == 17 ) ) ||
           sfxdesc[num].size < 3072 ) && FX_CacheUsed() < PRELOAD_BUDGET )
