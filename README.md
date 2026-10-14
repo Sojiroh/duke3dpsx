@@ -217,9 +217,16 @@ Loading E1L1 takes about 2000 vsyncs.
   The 3D emitters stop 6 KB before the end of the primitive buffer so that the weapon, HUD, menus
   and the tint always fit; dropped 3D quads are counted (`PROF tex:` line under `-DPS1_PROF`).
   Non-power-of-2 tiles that repeat are split exactly at the texture period, so they tile seamlessly.
-- **Textures**: a VRAM tile cache streams texture pages from `DUKE.DAT` on the CD. Half-resolution
+- **Textures**: a VRAM tile cache (x 256..1023, 12 pages of 256x256) streams tiles from `DUKE.DAT`
+  on the CD. Misses are served in coalesced reads: one CD command fetches every queued tile inside a
+  32-sector window plus up to 8 sectors of read-ahead while the working set is small; each level's
+  tiles are stored contiguously on the disc (`TILEGRP_<MAP>`), so seeks stay short. Half-resolution
   copies are used only when the recent working set (tiles used in the last 120 frames, plus locked
-  tiles) fills more than 60% of the cache, not merely because stale tiles still occupy VRAM.
+  tiles) fills more than 60% of the cache, not merely because stale tiles still occupy VRAM. A sprite
+  whose next animation frame is still streaming keeps showing its last resident frame.
+- **Display**: the GPU runs in the 256-pixel-wide mode (framebuffers 256x240) so the texture cache gets
+  the extra VRAM column; the game and engine still work in 320x240 logical coordinates, which the
+  renderer scales at primitive emission (`SCR_X`, `SCR_X3D`). The 3D view keeps its 160 columns.
 - **Sound effects**: VOC files are converted to SPU-ADPCM at build time and played through
   the audiolib FX API on the SPU.
 - **Music**: a MIDI-style sequencer driven by the Timer 2 interrupt. Song blocks are streamed
@@ -292,8 +299,8 @@ Known limitations:
 - Mirrors render as plain walls; ANM cutscenes (logo/episode intros) are skipped; no multiplayer,
   demos or RTS remote sounds.
 - Wall textures fall back to half-resolution copies under VRAM pressure (blocky up close).
-- Boot to the logo takes ~35 s and a level load ~35 s at 2x CD speed; saving takes several
-  seconds (BIOS card routines; music pauses meanwhile).
+- Boot to the logo takes ~13 s and a level load ~7 s at 2x CD speed (loading screens with progress
+  bars); saving takes several seconds (BIOS card routines; music pauses meanwhile).
 - Music is played by an SPU sequencer, not a General MIDI wavetable. The instrument samples come from
   the built-in synthesised bank unless a SoundFont is given explicitly (`DUKE_SF2`, see Building; the
   SoundFont's samples are then stored in `DUKE.DAT`). Following audiolib's EMIDI handling for a General

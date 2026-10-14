@@ -12,8 +12,9 @@ typedef int8_t s8;
 typedef int16_t s16;
 typedef int32_t s32;
 
-#define SCREEN_W 320
+#define SCREEN_W 320   /* logical width: what the game and the engine think the screen is (xdim) */
 #define SCREEN_H 240
+#define FB_W 256       /* PS1: physical frame buffer / display width (256-pixel GPU mode; render.c scales x by FB_W/SCREEN_W) */
 
 /* ---- video.c: display, double buffering, primitive list ---- */
 void video_init(void);

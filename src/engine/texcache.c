@@ -11,8 +11,8 @@ extern unsigned short tileaux[MAXTILES];
 #define NPAGES 12
 typedef struct { u16 cellx, celly; u16 w, h; } Page; /* w,h in texels */
 static const Page pages[NPAGES] = {
-	{320,0,256,256},{448,0,256,256},{576,0,256,256},{704,0,256,256},{832,0,256,256},{960,0,128,256},
-	{320,256,256,256},{448,256,256,256},{576,256,256,256},{704,256,256,256},{832,256,256,256},{960,256,128,256},
+	{256,0,256,256},{384,0,256,256},{512,0,256,256},{640,0,256,256},{768,0,256,256},{896,0,256,256},
+	{256,256,256,256},{384,256,256,256},{512,256,256,256},{640,256,256,256},{768,256,256,256},{896,256,256,256},
 };
 
 /* ---- kd-tree block allocator ------------------------------------------ */
@@ -108,7 +108,7 @@ static Slot slots[MAXSLOTS];
 static u16 tile2slot[MAXTILES];   /* piece 0 slot or 0xffff */
 static u32 texframe = 1;
 static u32 vram_used;             /* resident block texels */
-#define VRAM_TEXELS (704 * 512 * 2)
+#define VRAM_TEXELS (768 * 512 * 2)
 #define VRAM_PRESSURE (VRAM_TEXELS * 6 / 10)
 #define PRESSURE_WINDOW 120       /* frames: only slots used this recently (or locked) count as VRAM pressure */
 int tex_stat_resident, tex_stat_misses, tex_stat_loads, tex_stat_half;

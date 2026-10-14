@@ -43,10 +43,10 @@ void video_mark_overlay(void) { overlay_tail = prim_tail; }
 void video_init(void)
 {
 	ResetGraph(0);
-	SetDefDispEnv(&disp[0], 0, 0, SCREEN_W, SCREEN_H);
-	SetDefDispEnv(&disp[1], 0, SCREEN_H, SCREEN_W, SCREEN_H);
-	SetDefDrawEnv(&draw[0], 0, SCREEN_H, SCREEN_W, SCREEN_H);
-	SetDefDrawEnv(&draw[1], 0, 0, SCREEN_W, SCREEN_H);
+	SetDefDispEnv(&disp[0], 0, 0, FB_W, SCREEN_H);
+	SetDefDispEnv(&disp[1], 0, SCREEN_H, FB_W, SCREEN_H);
+	SetDefDrawEnv(&draw[0], 0, SCREEN_H, FB_W, SCREEN_H);
+	SetDefDrawEnv(&draw[1], 0, 0, FB_W, SCREEN_H);
 	draw[0].isbg = draw[1].isbg = 0;
 	draw[0].dtd = draw[1].dtd = 1; /* dithering on */
 	PutDispEnv(&disp[0]);
@@ -80,7 +80,7 @@ static void replay(DRAWENV *env, int on, int abr, int r, int g, int b)
 		setDrawOffset(&off, env->clip.x + env->ofs[0], env->clip.y + env->ofs[1]);
 		setPolyF4(&quad);
 		setRGB0(&quad, r, g, b);
-		setXY4(&quad, 0, 0, SCREEN_W, 0, 0, SCREEN_H, SCREEN_W, SCREEN_H);
+		setXY4(&quad, 0, 0, FB_W, 0, 0, SCREEN_H, FB_W, SCREEN_H);
 		setSemiTrans(&quad, 1);
 		((P_TAG *)&area)->addr = (u32)&tp;
 		((P_TAG *)&tp)->addr = (u32)&off;

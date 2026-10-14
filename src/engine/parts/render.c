@@ -18,6 +18,13 @@
 #endif
 #define MAXSPLIT 4
 
+/* PS1: the frame buffer is FB_W (256) pixels wide while the engine works in 320 logical columns.  Every x that
+   is written into a GPU primitive (or draw area / offset) goes through one of these two macros, so that
+   neighbouring quads keep sharing exact endpoints.  SCR_X: logical 320-space pixel; SCR_X3D: 3D column index
+   (the column engine runs at xdimen = width >> REND_XSHIFT = 160 columns, 1.6 physical pixels each). */
+#define SCR_X(x)   (((x) * FB_W) / SCREEN_W)
+#define SCR_X3D(x) (((x) * 8) / 5)
+
 typedef struct { short x, y; int u, v; unsigned char c; } QV;  /* u,v unwrapped texels; c brightness 0..128 */
 
 static u32 last_twin;
@@ -49,7 +56,7 @@ static void set_draw_offset(int x, int y)
 	if (x == cur_offx && y == cur_offy) return;
 	p = prim_alloc(sizeof(DR_OFFSET));
 	if (!p) return;
-	setDrawOffset(p, video_drawenv->clip.x + video_drawenv->ofs[0] + x, video_drawenv->clip.y + video_drawenv->ofs[1] + y);
+	setDrawOffset(p, video_drawenv->clip.x + video_drawenv->ofs[0] + SCR_X(x), video_drawenv->clip.y + video_drawenv->ofs[1] + y);
 	prim_link(p);
 	cur_offx = x; cur_offy = y;
 }
@@ -102,7 +109,7 @@ static void rend_draw_tint(void)
 	if (!p) return;
 	setPolyF4(p);
 	setRGB0(p, r * 4 * k / 63, g * 4 * k / 63, b * 4 * k / 63);
-	setXY4(p, 0, 0, SCREEN_W, 0, 0, SCREEN_H, SCREEN_W, SCREEN_H);
+	setXY4(p, 0, 0, FB_W, 0, 0, SCREEN_H, FB_W, SCREEN_H);
 	setSemiTrans(p, 1);
 	prim_link(p);
 }
@@ -578,10 +585,10 @@ static void wall_spans(long x1, long x2, short *uwal, short *dwal, long *swal, l
 		else { ur = ua + 1; swr = swa; }
 		if (swr <= 0) swr = swa;
 
-		q[0].x = xa << REND_XSHIFT; q[0].y = topL; q[0].u = ua; q[0].v = wall_v(swa, topL); q[0].c = wall_bright(swa);
-		q[1].x = xr << REND_XSHIFT; q[1].y = topR; q[1].u = ur; q[1].v = wall_v(swr, topR); q[1].c = wall_bright(swr);
-		q[2].x = xa << REND_XSHIFT; q[2].y = botL; q[2].u = ua; q[2].v = wall_v(swa, botL); q[2].c = q[0].c;
-		q[3].x = xr << REND_XSHIFT; q[3].y = botR; q[3].u = ur; q[3].v = wall_v(swr, botR); q[3].c = q[1].c;
+		q[0].x = SCR_X3D(xa); q[0].y = topL; q[0].u = ua; q[0].v = wall_v(swa, topL); q[0].c = wall_bright(swa);
+		q[1].x = SCR_X3D(xr); q[1].y = topR; q[1].u = ur; q[1].v = wall_v(swr, topR); q[1].c = wall_bright(swr);
+		q[2].x = SCR_X3D(xa); q[2].y = botL; q[2].u = ua; q[2].v = wall_v(swa, botL); q[2].c = q[0].c;
+		q[3].x = SCR_X3D(xr); q[3].y = botR; q[3].u = ur; q[3].v = wall_v(swr, botR); q[3].c = q[1].c;
 		if (have) { emit_single_v = (mode != 0); emit_quad(&ref, clut, q, trans, 1, 0); emit_single_v = 0; }
 		else if (mode == 0) emit_flat(q, tileavg[globalpicnum], 0);
 		x = xb + 1;
@@ -676,7 +683,7 @@ static inline void plane_vertex(QV *q, long x, long y)
 	int u, v, c;
 	PROF_COUNT(pc_pverts, 1);
 	plane_uv(x, y, &u, &v, &c);
-	q->x = x << REND_XSHIFT; q->y = y; q->u = u; q->v = v; q->c = c;
+	q->x = SCR_X3D(x); q->y = y; q->u = u; q->v = v; q->c = c;
 }
 
 /* emit one cell given its four corners (TL,TR,BL,BR already evaluated) */
@@ -1087,8 +1094,8 @@ static void set_cliprect(long cx1, long cy1, long cx2, long cy2)
 	if (cy1 < 0) cy1 = 0;
 	if (cx2 >= xdim) cx2 = xdim - 1;
 	if (cy2 >= ydim) cy2 = ydim - 1;
-	setDrawAreaXY(p, video_drawenv->clip.x + cx1, video_drawenv->clip.y + cy1,
-				  video_drawenv->clip.x + cx2, video_drawenv->clip.y + cy2);
+	setDrawAreaXY(p, video_drawenv->clip.x + SCR_X(cx1), video_drawenv->clip.y + cy1,
+				  video_drawenv->clip.x + SCR_X(cx2 + 1) - 1, video_drawenv->clip.y + cy2);
 	prim_link(p);
 }
 
@@ -1182,7 +1189,7 @@ static void dorotatesprite(long sx, long sy, long z, short a, short picnum, sign
 		/* corners: 0 TL, 1 TR, 3 BL, 2 BR of the whole tile */
 		for (k = 0; k < 4; k++) {
 			int c = (k == 0) ? 0 : (k == 1) ? 1 : (k == 2) ? 3 : 2;
-			q[k].x = px[c] >> 16; q[k].y = py[c] >> 16;
+			q[k].x = SCR_X(px[c] >> 16); q[k].y = py[c] >> 16;
 			q[k].u = (k == 0 || k == 2) ? 0 : ufar;
 			q[k].v = (k < 2) ? 0 : vfar;
 			if (dastat & 4) q[k].v = (k < 2) ? ysiz - 1 : 0;   /* y-flipped: top row first (texel floor(v) samples) */
@@ -1200,13 +1207,15 @@ static void dorotatesprite(long sx, long sy, long z, short a, short picnum, sign
 void rend_fillrect(long x1, long y1, long x2, long y2, long dacol)
 {
 	TILE *t;
+	long sx1 = SCR_X(x1), sx2 = SCR_X(x2 + 1);
+	if (sx2 <= sx1) return;
 	rend_2d();
 	t = prim_alloc(sizeof(TILE));
 	if (!t) return;
 	setTile(t);
 	setRGB0(t, palette[dacol*3] << 2, palette[dacol*3+1] << 2, palette[dacol*3+2] << 2);
-	setXY0(t, x1, y1);
-	setWH(t, x2 - x1 + 1, y2 - y1 + 1);
+	setXY0(t, sx1, y1);
+	setWH(t, sx2 - sx1, y2 - y1 + 1);
 	prim_link(t);
 }
 
@@ -1252,7 +1261,7 @@ void drawline256(long x1, long y1, long x2, long y2, char col)
 	if (!l) return;
 	setLineF2(l);
 	setRGB0(l, palette[col*3] << 2, palette[col*3+1] << 2, palette[col*3+2] << 2);
-	setXY2(l, x1 >> 12, y1 >> 12, x2 >> 12, y2 >> 12);
+	setXY2(l, SCR_X(x1 >> 12), y1 >> 12, SCR_X(x2 >> 12), y2 >> 12);
 	prim_link(l);
 }
 
