@@ -2,6 +2,9 @@
 #include "build.h"
 #include "data_index.h"
 
+/* PS1: the streaming code is cold next to tex_lookup(): size-optimised (tex_lookup/tex_resident keep -O2) */
+#pragma GCC optimize("Os")
+
 extern unsigned short tilesect[MAXTILES];
 extern unsigned char tilenpieces[MAXTILES];
 extern unsigned char tileflags[MAXTILES];
@@ -94,7 +97,7 @@ static void node_free(s16 n)
 }
 
 /* ---- resident slots ---------------------------------------------------- */
-#define MAXSLOTS 768
+#define MAXSLOTS 672   /* PS1: was 768 (peak resident tiles seen: ~400); the 96 slots paid for the prefetch code. A full table just evicts the LRU tile */
 typedef struct {
 	u16 picnum;
 	u8 piece, state;   /* state: 0 empty, 1 loading, 2 resident */
@@ -157,13 +160,37 @@ static volatile int cd_done;
 #ifndef TEX_RA_SECS
 #define TEX_RA_SECS 8            /* read-ahead may extend a run up to this many sectors (a window tile in the run's span is free) */
 #endif
-#ifndef TEX_RA_ACTIVE_PCT
-#define TEX_RA_ACTIVE_PCT 50     /* ... only while the recent working set uses less than this % of the cache VRAM (stale tiles are evicted first) */
-#endif
 static s16 run_slot[MAXRUN];
 static u8 run_off[MAXRUN];
 static int nrun, nreq;           /* nrun slots in flight; the first nreq were requested, the rest read-ahead */
 static u32 evict_count;   /* number of LRU evictions: a read-ahead run stops at its first eviction */
+/* PS1: prefetch wish list. tex_prefetch() (engine.c walker) fills it with tiles of the sectors around the player;
+   pump() moves it into the (empty) stream queue, so real misses and sprite requests always go first. Entries
+   leave the list when resident; a real miss for the same tile removes it (it is then an ordinary request). */
+#define PFQ_LEN 48
+#define PF_AGE 90                /* prefetch/read-ahead loads only evict tiles unused for PF_AGE frames (never one used in the last 30) and never unused read-ahead tiles */
+#ifndef TEX_RA_EVICT_PCT
+#define TEX_RA_EVICT_PCT 8       /* read-ahead/prefetch run while this % of the cache is free or evictable */
+#endif
+static u16 pfq[PFQ_LEN];
+static int pfn;
+#define PF_BUDGET 64             /* tiles that may be wish-listed per sector change (the walk can exceed the cache; standing still must go quiet) */
+static int pf_budget;
+static u32 pf_wait;              /* no prefetch before this frame (the last one found no room) */
+static u32 cd_pos;               /* CD head position after the last streaming read, sectors relative to TILEDATA (see pick_nearest) */
+static u32 evict_age = 1;        /* evict_lru() spares slots used within the last evict_age frames */
+static int pf_find(int picnum)
+{
+	int i;
+	for (i = 0; i < pfn; i++) if (pfq[i] == picnum) return i;
+	return -1;
+}
+#define pf_has(p) (pf_find(p) >= 0)
+static void pf_remove(int picnum)
+{
+	int i = pf_find(picnum);
+	if (i >= 0) memmove(&pfq[i], &pfq[i + 1], (--pfn - i) * sizeof(pfq[0]));
+}
 
 #ifdef PS1_PROF
 /* PS1 debug: streaming statistics, reported every 120 frames */
@@ -263,7 +290,8 @@ static int evict_lru(void)
 	for (s = 0; s < MAXSLOTS; s++) {
 		Slot *sl = &slots[s];
 		if (sl->state != 2 || sl->lock) continue;
-		if (sl->lastuse >= texframe) continue;   /* used this frame */
+		if (sl->lastuse + evict_age > texframe) continue;   /* used within the last evict_age frames (1 = this frame) */
+		if (evict_age > 1 && !sl->lastuse) continue;       /* a prefetch never displaces another unused prefetch/read-ahead tile */
 		if (sl->lastuse < oldest) { oldest = sl->lastuse; best = s; }
 	}
 	if (best < 0) return 0;
@@ -335,7 +363,7 @@ static void finish_load_from(int s, int stride, int h, const void *src)
 
 static void finish_load(int s, int stride, int h) { finish_load_from(s, stride, h, staging); }
 
-static void queue_tile(int picnum)
+static void queue_add(int picnum)
 {
 	int next = (qtail + 1) & (QLEN - 1);
 	if ((pendingbit[picnum >> 3] & (1 << (picnum & 7))) || next == qhead) return;
@@ -345,6 +373,11 @@ static void queue_tile(int picnum)
 #endif
 	qtail = next;
 	pendingbit[picnum >> 3] |= 1 << (picnum & 7);
+}
+static void queue_tile(int picnum)
+{
+	if (pfn && !(pendingbit[picnum >> 3] & (1 << (picnum & 7)))) pf_remove(picnum);   /* a real request supersedes the wish */
+	queue_add(picnum);
 }
 
 /* PS1: sprite tiles jump ahead of the wall/floor tiles waiting in the queue (a sprite whose tile is not
@@ -364,6 +397,7 @@ static void queue_tile_prio(int picnum)
 		qf0 = QF(qhead + i);
 #endif
 	} else {
+		if (pfn) pf_remove(picnum);
 		if (n == QLEN - 1) {   /* full: the newest wall/floor request is re-issued by the next frame that needs it */
 			qtail = (qtail - 1) & (QLEN - 1);
 			pendingbit[queue[qtail] >> 3] &= ~(1 << (queue[qtail] & 7));
@@ -387,6 +421,72 @@ static void queue_tile_prio(int picnum)
 	nprio++;
 }
 
+/* a prefetched / read-ahead slot is the first LRU victim and not part of the working set */
+static void mark_old(int s)
+{
+	Slot *sl = &slots[s];
+	sl->lastuse = 0;
+	if (!slot_active(sl) && active_frame == texframe) { u32 b = node_texels(sl->node); active_texels = active_texels > b ? active_texels - b : 0; }
+}
+
+/* % of the cache VRAM that is free or held by unlocked slots used before but unused for PF_AGE frames */
+int tex_evictable_pct(void)
+{
+	u32 t = VRAM_TEXELS - vram_used;
+	int s;
+	for (s = 0; s < MAXSLOTS; s++) {
+		const Slot *sl = &slots[s];
+		if (sl->state == 2 && !sl->lock && sl->node >= 0 && sl->lastuse && sl->lastuse + PF_AGE < texframe) t += node_texels(sl->node);
+	}
+	return (int)(t * 100 / VRAM_TEXELS);
+}
+
+void tex_prefetch_begin(void) { pfn = 0; pf_budget = PF_BUDGET; }
+
+/* PS1: first 3D frame after a level start (tex_quiesce): the level preload stops at a VRAM budget, so tiles right
+   next to the player can still be missing. Load the nearest PF_BOOT wish-list tiles now, in one go (batched by disc
+   position), instead of drawing placeholders for the first seconds; only while the cache has room. */
+#define PF_BOOT 16
+#define PF_BOOT_VRAM_PCT 80
+static u8 pf_boot_pending;
+void tex_prefetch_boot(void)
+{
+	short list[PF_BOOT];
+	int i, j, n = 0;
+	if (!pf_boot_pending) return;
+	pf_boot_pending = 0;
+	for (i = 0; i < pfn && n < PF_BOOT; i++) {
+		u32 key = tex_sector(pfq[i]);
+		if (tile2slot[pfq[i]] != 0xffff) continue;
+		for (j = n; j > 0 && tex_sector(list[j - 1]) > key; j--) list[j] = list[j - 1];
+		list[j] = pfq[i]; n++;
+	}
+	if (tex_vram_pct() < PF_BOOT_VRAM_PCT) tex_preload_list(list, n);
+	pfn = 0;
+}
+
+int tex_prefetch(int picnum)
+{
+	if ((unsigned)picnum >= MAXTILES || tilesizx[picnum] <= 0 || tilesizy[picnum] <= 0 || tilenpieces[picnum] > 1) return 0;
+	if (tile2slot[picnum] != 0xffff || (pendingbit[picnum >> 3] & (1 << (picnum & 7))) || pf_has(picnum)) return 0;
+	if (pfn >= PFQ_LEN || !pf_budget) return -1;
+	pf_budget--;
+	pfq[pfn++] = picnum;
+	return 1;
+}
+
+/* Called by pump() with an empty stream queue and an idle CD: queue the wish list (nearest tiles first) when the
+   cache has room or old tiles to give up. start_run() loads what fits in the head's CD window and drops the rest
+   from the queue (they stay on the wish list for the next pump). */
+static void pf_issue(void)
+{
+	int i, w = 0;
+	for (i = 0; i < pfn; i++) if (tile2slot[pfq[i]] == 0xffff) pfq[w++] = pfq[i];
+	pfn = w;
+	if (!pfn || texframe < pf_wait || tex_evictable_pct() < TEX_RA_EVICT_PCT) return;
+	for (i = 0; i < pfn; i++) queue_add(pfq[i]);
+}
+
 /* cd_done: 0 = read pending, 1 = staged data valid, -1 = CD error (the staging buffer is not valid) */
 static void cd_cb(int ok) { cd_done = ok ? 1 : -1; }
 
@@ -401,7 +501,7 @@ static int inflight_finish(void)
 		if (cd_done > 0) {
 			finish_load_from(s, piece_stride(slots[s].w), piece_rows(slots[s].h), (const u8 *)staging + run_off[i] * 2048);
 #ifdef PS1_PROF
-			if (i < nreq) { prof_lat += (u16)((u16)video_vsync_count() - run_qf[i]); prof_latn++; }
+			if (i < nreq && run_qf[i]) { prof_lat += (u16)((u16)video_vsync_count() - run_qf[i]); prof_latn++; }
 #endif
 		} else {   /* PS1: failed read: never mark the tiles valid; free the slots and request the wanted tiles again */
 			int pic = slots[s].picnum;
@@ -519,14 +619,18 @@ void tex_preload(int picnum)
    in the window are loaded too (as old LRU entries) while the recent working set is small. */
 static void start_run(int picnum, u16 qfh)
 {
-	struct { u32 sec; u16 pic; u8 secs, qi; } c[QLEN];
+	struct { u32 sec; u16 pic; u8 secs, qi, pf; } c[QLEN];
 	u8 taken[QLEN];
-	int stride, hh, s, n = (qtail - qhead) & (QLEN - 1), k = 0, i, j, cnt, bestcnt;
+	int stride, hh, s, n = (qtail - qhead) & (QLEN - 1), k = 0, i, j, cnt, bestcnt, pfhead;
 	u32 hs, lo;
 	int hsecs, end, minpic = picnum, maxpic = picnum;
 	(void)qfh;
+	pfhead = pf_has(picnum);
+	evict_age = pfhead ? PF_AGE : 1;
 	s = begin_load(picnum, 0, &stride, &hh, &hs);
-	if (s < 0) return;
+	evict_age = 1;
+	if (s < 0) { if (pfhead) pf_wait = texframe + PF_AGE; return; }   /* no room for a prefetch: try again later */
+	if (pfhead) mark_old(s);
 	hsecs = (stride * hh + 2047) / 2048;
 	for (i = 0; i < n; i++) {
 		int p = queue[(qhead + i) & (QLEN - 1)], xo, yo, w, h;
@@ -535,7 +639,7 @@ static void start_run(int picnum, u16 qfh)
 		if (tilenpieces[p] > 1 || tilesizx[p] <= 0 || tilesizy[p] <= 0 || tile2slot[p] != 0xffff) continue;
 		piece_info(p, 0, &xo, &yo, &w, &h, &sec);
 		if (w <= 0 || h <= 0) continue;
-		c[k].sec = sec; c[k].pic = p; c[k].qi = i;
+		c[k].sec = sec; c[k].pic = p; c[k].qi = i; c[k].pf = pf_has(p);
 		c[k].secs = (piece_stride(w) * piece_rows(h) + 2047) / 2048;
 		k++;
 	}
@@ -549,57 +653,64 @@ static void start_run(int picnum, u16 qfh)
 	}
 	nrun = 1; run_slot[0] = s; run_off[0] = hs - lo; end = hs - lo + hsecs;
 #ifdef PS1_PROF
-	run_qf[0] = qfh;
+	run_qf[0] = pfhead ? 0 : qfh;
 #endif
 	for (i = 0; i < k && nrun < MAXRUN; i++) {
 		int st2, h2, s2, secs2;
 		u32 sec2;
 		if (c[i].sec < lo || c[i].sec + c[i].secs > lo + TEX_WIN) continue;
+		evict_age = c[i].pf ? PF_AGE : 1;
 		s2 = begin_load(c[i].pic, 0, &st2, &h2, &sec2);
+		evict_age = 1;
 		if (s2 < 0) break;
 		secs2 = (st2 * h2 + 2047) / 2048;
 		if (sec2 < lo || sec2 + secs2 > lo + TEX_WIN) { evict_slot(s2); continue; }   /* half-res choice changed meanwhile */
 		run_slot[nrun] = s2; run_off[nrun] = sec2 - lo;
 		if ((int)(sec2 - lo) + secs2 > end) end = sec2 - lo + secs2;
 #ifdef PS1_PROF
-		run_qf[nrun] = QF(qhead + c[i].qi);
+		run_qf[nrun] = c[i].pf ? 0 : QF(qhead + c[i].qi);   /* 0 = prefetch: not a request, excluded from the latency */
 #endif
 		taken[c[i].qi] = 1;
+		if (c[i].pf) mark_old(s2);
 		if (c[i].pic < minpic) minpic = c[i].pic;
 		if (c[i].pic > maxpic) maxpic = c[i].pic;
 		nrun++;
 	}
 	nreq = nrun;
 #if TEX_READAHEAD
-	if (tex_active_pct() < TEX_RA_ACTIVE_PCT) {
-		int ra = end > TEX_RA_SECS ? end : TEX_RA_SECS, t, t0 = minpic - 48, t1 = maxpic + 48;
+	if (tex_evictable_pct() >= TEX_RA_EVICT_PCT) {
+		int ra = end > TEX_RA_SECS ? end : TEX_RA_SECS, t, x, lim, t0 = minpic - 48, t1 = maxpic + 48, nn;
 		u32 ev = evict_count;
 		if (ra > TEX_WIN) ra = TEX_WIN;
 		if (t0 < 0) t0 = 0;
 		if (t1 >= MAXTILES) t1 = MAXTILES - 1;
-		for (t = t0; t <= t1 && nrun < MAXRUN; t++) {
+		nn = pfn + t1 - t0 + 1;
+		/* wish-list tiles first (they will be needed soon: a window of up to 16 sectors beyond the request is worth
+		   one extra CD command later), then the unrequested neighbours of the requested tiles */
+		for (x = 0; x < nn && nrun < MAXRUN; x++) {
 			int xo, yo, w, h, st2, h2, s2, secs, off;
 			u32 sec, sec2;
+			if (x == pfn) ev = evict_count;   /* neighbour read-ahead (below) never evicts */
+			if (x < pfn) { t = pfq[x]; lim = end + 16 > TEX_WIN ? TEX_WIN : end + 16; }
+			else { t = t0 + x - pfn; lim = ra; }
 			if (tilesizx[t] <= 0 || tilesizy[t] <= 0 || tilenpieces[t] > 1 || tile2slot[t] != 0xffff) continue;
 			if (piece_info(t, 0, &xo, &yo, &w, &h, &sec) || w <= 0 || h <= 0) continue;
 			secs = (piece_stride(w) * piece_rows(h) + 2047) / 2048;
-			if (sec < lo || (int)(sec - lo) + secs > ra) continue;
+			if (sec < lo || (int)(sec - lo) + secs > lim) continue;
+			evict_age = PF_AGE;
 			s2 = begin_load(t, 0, &st2, &h2, &sec2);
+			evict_age = 1;
 			if (s2 < 0) break;
 			off = sec2 - lo;
 			if (sec2 < lo || off + (st2 * h2 + 2047) / 2048 > TEX_WIN) { evict_slot(s2); continue; }
-			{   /* old LRU entry: evicted first, not part of the working set */
-				Slot *sl = &slots[s2];
-				sl->lastuse = 0;
-				if (!slot_active(sl) && active_frame == texframe) { u32 b = node_texels(sl->node); active_texels = active_texels > b ? active_texels - b : 0; }
-			}
+			mark_old(s2);   /* old LRU entry: evicted first, not part of the working set */
 			run_slot[nrun] = s2; run_off[nrun] = off;
 			if (off + (st2 * h2 + 2047) / 2048 > end) end = off + (st2 * h2 + 2047) / 2048;
 #ifdef PS1_PROF
 			prof_ra++;
 #endif
 			nrun++;
-			if (evict_count != ev) break;   /* the cache is not as empty as assumed */
+			if (x >= pfn && evict_count != ev) break;   /* the cache is not as empty as assumed */
 		}
 	}
 #endif
@@ -609,6 +720,7 @@ static void start_run(int picnum, u16 qfh)
 		for (i = 0; i < n; i++) {
 			int q = queue[(qhead + i) & (QLEN - 1)];
 			if (taken[i]) { pendingbit[q >> 3] &= ~(1 << (q & 7)); continue; }
+			if (pf_has(q)) { pendingbit[q >> 3] &= ~(1 << (q & 7)); continue; }   /* prefetch outside the window: stays on the wish list */
 			queue[(qhead + w) & (QLEN - 1)] = q;
 #ifdef PS1_PROF
 			QF(qhead + w) = QF(qhead + i);
@@ -618,6 +730,7 @@ static void start_run(int picnum, u16 qfh)
 		}
 		qtail = (qhead + w) & (QLEN - 1); nprio = np;
 	}
+	cd_pos = lo + end;
 	cd_done = 0;
 #ifdef PS1_PROF
 	prof_cmds++;
@@ -628,12 +741,49 @@ static void start_run(int picnum, u16 qfh)
 	}
 }
 
+/* PS1: the CD head position after the last streaming read (sector relative to TILEDATA). The level group keeps
+   walls/floors and sprites in different disc regions, so serving the queue in request order costs a long seek per
+   command; the next run starts at the queued tile nearest to the head (sprite requests count as SEEK_NONPRIO sectors
+   nearer: a missing sprite is not drawn at all). */
+#define SEEK_NONPRIO 1000
+static void pick_nearest(int n)
+{
+	int i, j, best = 0;
+	u32 bc = 0xffffffff;
+	for (i = 0; i < n; i++) {
+		int p = queue[(qhead + i) & (QLEN - 1)];
+		u32 d, c, sec = tex_sector(p);
+		d = sec > cd_pos ? sec - cd_pos : cd_pos - sec;
+		c = d + (i < nprio ? 0 : SEEK_NONPRIO);
+		if (c < bc) { bc = c; best = i; }
+	}
+	if (best) {
+		int p = queue[(qhead + best) & (QLEN - 1)];
+#ifdef PS1_PROF
+		u16 qfv = QF(qhead + best);
+#endif
+		for (j = best; j > 0; j--) {
+			queue[(qhead + j) & (QLEN - 1)] = queue[(qhead + j - 1) & (QLEN - 1)];
+#ifdef PS1_PROF
+			QF(qhead + j) = QF(qhead + j - 1);
+#endif
+		}
+		queue[qhead] = p;
+#ifdef PS1_PROF
+		QF(qhead) = qfv;
+#endif
+	}
+}
+
 static void pump(void)
 {
 	if (!inflight_finish()) return;
 	if (pak_busy()) return;   /* a music block read is in flight or the previous read's pause has not completed: retry next frame */
+	if (qhead == qtail && pfn) pf_issue();
 	while (qhead != qtail) {
-		int picnum = queue[qhead];
+		int picnum, n = (qtail - qhead) & (QLEN - 1);
+		if (n > 1) pick_nearest(n);
+		picnum = queue[qhead];
 		int p, np;
 #ifdef PS1_PROF
 		u16 qfh = QF(qhead);
@@ -664,6 +814,7 @@ static void pump(void)
 	}
 }
 
+__attribute__((optimize("O2")))
 int tex_lookup(int picnum, int piece, TexRef *out)
 {
 	int s = find_slot(picnum, piece);
@@ -698,6 +849,7 @@ int tex_npieces(int picnum) { return tilenpieces[picnum] ? tilenpieces[picnum] :
 
 /* PS1: 1 if every piece of the tile is resident in VRAM (does not touch LRU, no miss stat). When request is set
    and the tile is neither resident nor already loading, it is queued for streaming like a tex_lookup() miss. */
+__attribute__((optimize("O2")))
 int tex_resident(int picnum, int request)
 {
 	int p, np = tilenpieces[picnum] ? tilenpieces[picnum] : 1, ok = 1;
@@ -742,7 +894,7 @@ void tex_frame(void)
 void tex_quiesce(void)
 {
 	while (!inflight_finish()) ;
-	qhead = qtail = nprio = 0;
+	qhead = qtail = nprio = 0; pfn = 0; pf_boot_pending = 1;
 	memset(pendingbit, 0, sizeof(pendingbit));
 }
 

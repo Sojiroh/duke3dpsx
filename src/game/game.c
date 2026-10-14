@@ -78,6 +78,7 @@ char confilename[128] = {"GAME.CON"},boardfilename[128] = {0};
 char waterpal[768], slimepal[768], titlepal[768], drealms[768], endingpal[768];
 char firstdemofile[80] = { '\0' };
 
+extern void tex_prefetch_sector(short sectnum);   /* engine.c: low-priority prefetch of the tiles around the player */
 #define patchstatusbar(x1,y1,x2,y2)                                        \
 {                                                                          \
     rotatesprite(0,(200-34)<<16,65536L,0,BOTTOMSTATUSBAR,4,0,10+16+64+128, \
@@ -2389,6 +2390,7 @@ void displayrooms(short snum,long smoothratio)
            the primitive list, makes every uncovered pixel black instead. */
         clearview(0);
 #endif
+        tex_prefetch_sector(sect);   /* PS1: stream in the tiles of the neighbouring sectors while the CD is idle */
         PFS_MARK();
         drawrooms(cposx,cposy,cposz,cang,choriz,sect);
         PFS_LAP(0);

@@ -253,6 +253,8 @@ int FX_LoadSample(fx_sample *s)
 	return 1;
 }
 
+int FX_CacheSize(void) { return (int)(SPU_FX_LIMIT - SPU_FX_BASE); }
+
 int FX_CacheUsed(void)
 {
 	u32 used = 0;

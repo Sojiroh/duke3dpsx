@@ -78,6 +78,8 @@ typedef struct fx_sample
 int  FX_LoadSample( fx_sample *s );
 /* Bytes of SPU RAM currently used by the sample cache. */
 int  FX_CacheUsed( void );
+/* Total bytes of the SPU RAM sample cache. */
+int  FX_CacheSize( void );
 /* Service finished voices (invokes the callback); called from audio_update(). */
 void fx_update( void );
 

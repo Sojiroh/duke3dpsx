@@ -32,6 +32,11 @@ void tex_flush(void);                                 /* evict everything except
 void tex_lock(int picnum, int lock);                  /* keep resident (HUD etc.) */
 extern int tex_stat_resident, tex_stat_misses, tex_stat_loads, tex_stat_half;   /* half = resident half-res tiles */
 int tex_active_pct(void);                            /* % of cache VRAM used by the recent working set (half-res decision) */
+int tex_evictable_pct(void);                         /* % of the cache VRAM that is free or in unlocked slots unused for ~90 frames (gates read-ahead/prefetch) */
+void tex_prefetch_begin(void);                       /* forget the prefetch wish list (the player moved to another sector) */
+int tex_prefetch(int picnum);                        /* low-priority load request: 1 = added, 0 = skipped (resident/pending/invalid), -1 = list full */
+void tex_prefetch_boot(void);                        /* first walk after a level start: load the nearest wish-list tiles synchronously */
+void tex_prefetch_sector(short sectnum);             /* engine.c: collect the tiles of the sectors around sectnum (BFS over portals) and tex_prefetch() them */
 #ifdef PS1_PROF
 extern int tex_stat_halfloads, tex_stat_oldhalf;     /* debug: half-res loads actually chosen / chosen by the old vram_used rule */
 #endif

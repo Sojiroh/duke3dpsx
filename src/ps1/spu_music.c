@@ -1,8 +1,8 @@
 /* SPU music sequencer: MUSIC_* API.
  *
  * Songs are "MSQ1" event streams (tools/mkmusic.py) stored in DUKE.DAT under the original .MID
- * names; they are streamed from the CD through two 4 KB ring blocks (music_update() prefetches the
- * next block with pak_read_async()).  The instrument bank ("MUSBANK", ADPCM samples + region table)
+ * names; each song is read once into a static RAM buffer when it starts (no CD reads while playing).
+ * The instrument bank ("MUSBANK", ADPCM samples + region table)
  * is uploaded to SPU RAM once by MUSIC_Init().  The sequencer runs from a 120 Hz timer-2 interrupt
  * on SPU voices 0..SPU_NMUSIC-1; everything the ISR touches is plain RAM + SPU registers.
  */
@@ -14,7 +14,7 @@
 int MUSIC_ErrorCode = MUSIC_Ok;
 
 #define NMV SPU_NMUSIC
-#define BLK 4096
+
 #define MAXREGIONS 120
 #define MUSIC_LEVEL 0x2000        /* hardware volume of a full-velocity note (0x3FFF = max) */
 
@@ -47,18 +47,16 @@ typedef struct {
 static chan_t chan[16];
 static mvoice_t mv[NMV];
 
-/* stream state (ISR owns cur_*, rp, m_wait; main thread owns the ring slots that are not current) */
-static u8 ring[2][BLK] __attribute__((aligned(4)));
-static volatile u16 slotblk[2];
-static volatile u8 cur_slot;
-static volatile u32 cur_blk, rp;
-static u32 nblk, song_sector, song_sectors;
+/* stream state (ISR owns rp, m_wait) */
+#define SONG_SECTORS 20 /* largest song in DUKE.DAT is 40783 bytes */
+#define SONG_BYTES (SONG_SECTORS * 2048)
+static u8 songbuf[SONG_BYTES] __attribute__((aligned(4)));
+static volatile u32 rp;
+static u32 song_len, song_sector, song_sectors;
 static volatile u8 m_playing, m_paused, m_loop, m_stall;
 static volatile u32 m_wait, m_ticks;
 static int m_master = 255;
-static volatile u8 rd_inflight, rd_done, rd_failed, rd_slot;
-static volatile u16 rd_blk;
-static u32 stat_stalls, stat_events, stat_blocks;
+static u32 stat_stalls, stat_events;
 
 static const u8 pan_cos[32] = {
 	255, 255, 255, 253, 251, 248, 244, 240, 235, 230, 224, 217, 210, 202, 194, 186,
@@ -186,12 +184,8 @@ static void note_on(int ch, int note, int vel, u32 dur)
 
 static inline u32 rb(void)
 {
-	u32 v = ring[cur_slot][rp++];
-	if (rp == BLK) {
-		cur_slot ^= 1;
-		cur_blk = (cur_blk + 1 < nblk) ? cur_blk + 1 : 0;
-		rp = 0;
-	}
+	u32 v = songbuf[rp];
+	if (rp + 1 < song_len) rp++;
 	return v;
 }
 
@@ -203,19 +197,6 @@ static u32 rvlq(void)
 		v = (v << 7) | (b & 0x7F);
 	} while (b & 0x80);
 	return v;
-}
-
-/* 1 if at least 16 bytes can be read from the current position without waiting for the CD */
-static int seq_need(void)
-{
-	if (nblk <= 1) return 1;
-	u32 other = cur_slot ^ 1;
-	if (rp + 16 > BLK) {
-		u32 nxt = (cur_blk + 1 < nblk) ? cur_blk + 1 : 0;
-		return slotblk[other] == nxt;
-	}
-	if (cur_blk == nblk - 1) return slotblk[other] == 0; /* the loop target must be resident */
-	return 1;
 }
 
 static void chan_reset(void)
@@ -231,9 +212,6 @@ static void chan_reset(void)
 
 static void seq_rewind(void)
 {
-	if (nblk <= 1) cur_slot = 0;
-	else cur_slot = (slotblk[0] == 0) ? 0 : 1;
-	cur_blk = 0;
 	rp = 16;
 	chan_reset();
 }
@@ -316,8 +294,8 @@ static void music_isr(void)
 	}
 	if (m_wait) m_wait--;
 	while (m_wait == 0 && m_playing) {
-		if (!seq_need()) { m_stall = 1; stat_stalls++; return; }
 		m_stall = 0;
+
 		seq_event();
 		if (!m_playing) return;
 		m_wait = rvlq();
@@ -326,47 +304,6 @@ static void music_isr(void)
 
 /* ------------------------------------------------------------------------------------------ */
 /* main-thread side: stream prefetch                                                           */
-/* ------------------------------------------------------------------------------------------ */
-
-/* IRQ context; ok = 0: CD error or timeout (the ring slot stays invalid and is requested again) */
-static void rd_cb(int ok) { if (ok) rd_done = 1; else rd_failed = 1; }
-
-static u32 blk_sectors(u32 blk)
-{
-	u32 first = blk * (BLK / 2048);
-	u32 n = song_sectors - first;
-	return n > BLK / 2048 ? BLK / 2048 : n;
-}
-
-void music_update(void)
-{
-	if (!m_playing || nblk <= 1) return;
-	if (rd_inflight) {
-		if (!rd_done && !rd_failed) return;
-		/* PS1: a failed read leaves the slot marked invalid (slotblk = 0xFFFF set when it was issued),
-		   so the code below requests the same block again */
-		if (rd_done) slotblk[rd_slot] = rd_blk;
-		rd_inflight = 0;
-#ifdef PS1_PROF
-		if (rd_done && stat_blocks++ < 3)
-			dbg("music: streamed block %u/%u into ring slot %u (%u blocks so far, ticks %u, events %u, stalls %u)\n",
-			    (unsigned)rd_blk, (unsigned)nblk, (unsigned)rd_slot, (unsigned)stat_blocks, (unsigned)m_ticks,
-			    (unsigned)stat_events, (unsigned)stat_stalls);
-#endif
-	}
-	u32 other = cur_slot ^ 1;
-	u32 nxt = (cur_blk + 1 < nblk) ? cur_blk + 1 : 0;
-	if (slotblk[other] == nxt || pak_busy()) return;
-	slotblk[other] = 0xFFFF;
-	rd_slot = (u8)other;
-	rd_blk = (u16)nxt;
-	rd_done = rd_failed = 0;
-	rd_inflight = 1;
-	if (!pak_read_async(song_sector + nxt * (BLK / 2048), blk_sectors(nxt), ring[other], rd_cb)) {
-		rd_inflight = 0;
-		slotblk[other] = 0xFFFF;
-	}
-}
 
 /* ------------------------------------------------------------------------------------------ */
 /* public API                                                                                  */
@@ -525,21 +462,20 @@ int MUSIC_PlaySong(unsigned char *song, int loopflag)
 	}
 	song_sector = e->sector;
 	song_sectors = (e->size + 2047) / 2048;
-	if (pak_read(song_sector, blk_sectors(0), ring[0]) < 0 || memcmp(ring[0], "MSQ1", 4)) {
+	/* PS1: the whole song is read once into songbuf; the sequencer never touches the CD while playing */
+	if (song_sectors > SONG_SECTORS) {
+		dbg("music: song %s too large (%u bytes > %u)\n", name, (unsigned)e->size, (unsigned)SONG_BYTES);
 		MUSIC_ErrorCode = MUSIC_MidiError;
 		return MUSIC_Error;
 	}
-	u32 total = 16 + *(u32 *)(ring[0] + 4);
-	nblk = (total + BLK - 1) / BLK;
-	rd_inflight = 0;
-	slotblk[0] = 0;
-	slotblk[1] = 0xFFFF;
-	if (nblk > 1) {
-		if (pak_read(song_sector + BLK / 2048, blk_sectors(1), ring[1]) < 0) {
-			MUSIC_ErrorCode = MUSIC_MidiError;
-			return MUSIC_Error;
-		}
-		slotblk[1] = 1;
+	if (pak_read(song_sector, song_sectors, songbuf) < 0 || memcmp(songbuf, "MSQ1", 4)) {
+		MUSIC_ErrorCode = MUSIC_MidiError;
+		return MUSIC_Error;
+	}
+	song_len = 16 + *(u32 *)(songbuf + 4);
+	if (song_len > song_sectors * 2048) {
+		MUSIC_ErrorCode = MUSIC_MidiError;
+		return MUSIC_Error;
 	}
 	EnterCriticalSection();
 	m_loop = loopflag != 0;
@@ -559,8 +495,8 @@ void music_debug(void)
 {
 	int act = 0;
 	for (int i = 0; i < NMV; i++) act += mv[i].state != 0;
-	dbg("music: playing=%d paused=%d loop=%d ticks=%u blk=%u/%u rp=%u wait=%u stalls=%u events=%u active=%d timer=%08x\n",
-	    m_playing, m_paused, m_loop, (unsigned)m_ticks, (unsigned)cur_blk, (unsigned)nblk, (unsigned)rp, (unsigned)m_wait,
+	dbg("music: playing=%d paused=%d loop=%d ticks=%u len=%u rp=%u wait=%u stalls=%u events=%u active=%d timer=%08x\n",
+	    m_playing, m_paused, m_loop, (unsigned)m_ticks, (unsigned)song_len, (unsigned)rp, (unsigned)m_wait,
 	    (unsigned)stat_stalls, (unsigned)stat_events, act, (unsigned)TIMER_VALUE(2));
 	for (int i = 0; i < NMV; i++)
 		if (mv[i].state)

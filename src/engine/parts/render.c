@@ -116,16 +116,17 @@ static void rend_draw_tint(void)
 
 #ifdef PS1_PROF
 /* PS1 debug: every 120 frames print texture-cache and primitive-buffer statistics */
+static int prof_flat;   /* placeholder quads emitted by emit_flat (tile not resident) */
 static void rend_prof_frame(void)
 {
 	static int n, maxbytes;
 	int b = video_list_bytes();
 	if (b > maxbytes) maxbytes = b;
 	if (++n < 120) return;
-	dbg("PROF tex: resident %d half-res %d vram %d%% active %d%% loads %d (half %d, old rule would be half %d) misses %d | prims: max list %d bytes, dropped 3D %d (reserve %d)\n",
+	dbg("PROF tex: resident %d half-res %d vram %d%% active %d%% loads %d (half %d, old rule would be half %d) misses %d flat/frame %d.%02d | prims: max list %d bytes, dropped 3D %d (reserve %d)\n",
 		tex_stat_resident, tex_stat_half, tex_vram_pct(), tex_active_pct(), tex_stat_loads, tex_stat_halfloads, tex_stat_oldhalf, tex_stat_misses,
-		maxbytes, rend_dropped_3d, PRIM_RESERVE);
-	n = 0; maxbytes = 0; rend_dropped_3d = 0;
+		prof_flat / 120, prof_flat * 100 / 120 % 100, maxbytes, rend_dropped_3d, PRIM_RESERVE);
+	n = 0; maxbytes = 0; rend_dropped_3d = 0; prof_flat = 0;
 }
 #endif
 
@@ -411,6 +412,9 @@ clamp:
 /* untextured fallback while a tile is streaming in */
 static void emit_flat(const QV *q, u16 col15, int trans)
 {
+#ifdef PS1_PROF
+	prof_flat++;
+#endif
 	POLY_G4 *p = prim_3d_full() ? NULL : prim_alloc(sizeof(POLY_G4));
 	int r = (col15 & 31) << 3, g = ((col15 >> 5) & 31) << 3, b = ((col15 >> 10) & 31) << 3, i;
 	if (!p) { rend_dropped_3d++; return; }

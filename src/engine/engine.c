@@ -486,5 +486,71 @@ void drawline16(long x1, long y1, long x2, long y2, char col) {}
 void setpalookupaddress(char *dapalookup) {}
 void faketimerhandler(void) {}
 
+/* PS1: proximity prefetch. Breadth-first walk over the portals around the player's sector (nearest first, at most
+   PF_DEPTH hops): the floor/ceiling/wall/masked-wall tiles and the visible sprites of each sector are handed to
+   tex_prefetch(), which streams them in at low priority while the CD is otherwise idle. Restarted from scratch
+   when the player enters another sector, topped up every PF_PERIOD frames; stops as soon as the wish list is full. */
+#define PF_DEPTH 6
+#define PF_SECTS 64
+#define PF_PERIOD 24
+/* tile p, and for an animated tile the whole cycle (at most PF_ANIM frames after it); -1 = wish list full */
+#define PF_ANIM 8
+__attribute__((optimize("Os")))
+static int pf_add(int p)
+{
+	int n = 0;
+	if ((unsigned)p >= MAXTILES) return 0;
+	if (picanm[p] & 192) { n = picanm[p] & 63; if (n > PF_ANIM) n = PF_ANIM; }
+	do { if (tex_prefetch(p++) < 0) return -1; } while (n-- > 0);
+	return 0;
+}
+__attribute__((optimize("Os")))
+static void pf_walk(short sectnum)
+{
+	unsigned char *visited = (unsigned char *)gotsector;   /* scratch: drawrooms() clears it first thing */
+	short bfs[PF_SECTS];
+	unsigned char depth[PF_SECTS];
+	int head = 0, tail = 0, w, i;
+	memset(visited, 0, (numsectors + 7) >> 3);
+	visited[sectnum >> 3] |= 1 << (sectnum & 7);
+	bfs[0] = sectnum; depth[0] = 0; tail = 1;
+#define PF_TILE(p) do { if (pf_add(p) < 0) return; } while (0)
+	while (head < tail) {
+		const sectortype *sec = &sector[bfs[head]];
+		int d = depth[head], wend = sec->wallptr + sec->wallnum;
+		PF_TILE(sec->ceilingpicnum);
+		PF_TILE(sec->floorpicnum);
+		for (w = sec->wallptr; w < wend; w++) {
+			const walltype *wal = &wall[w];
+			PF_TILE(wal->picnum);
+			if (wal->cstat & (16 | 32)) PF_TILE(wal->overpicnum);
+			if (wal->nextsector >= 0) {
+				int ns = wal->nextsector;
+				if (wal->nextwall >= 0) PF_TILE(wall[wal->nextwall].picnum);
+				if (d < PF_DEPTH && tail < PF_SECTS && !(visited[ns >> 3] & (1 << (ns & 7)))) {
+					visited[ns >> 3] |= 1 << (ns & 7);
+					bfs[tail] = ns; depth[tail++] = d + 1;
+				}
+			}
+		}
+		for (i = headspritesect[bfs[head]]; i >= 0; i = nextspritesect[i])
+			if (!(sprite[i].cstat & 32768)) PF_TILE(sprite[i].picnum);
+		head++;
+	}
+#undef PF_TILE
+}
+
+void tex_prefetch_sector(short sectnum)
+{
+	static short lastsect = -1;
+	static unsigned char tick;
+	if ((unsigned)sectnum >= (unsigned)numsectors) return;
+	if (sectnum != lastsect) { lastsect = sectnum; tick = 0; tex_prefetch_begin(); }
+	else if (++tick < PF_PERIOD) return;
+	else tick = 0;
+	pf_walk(sectnum);
+	tex_prefetch_boot();
+}
+
 #include "parts/engine_core.c"
 #include "parts/render.c"

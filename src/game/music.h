@@ -45,8 +45,6 @@ int   MUSIC_StopSong( void );
 int   MUSIC_PlaySong( unsigned char *song, int loopflag );
 void  MUSIC_RegisterTimbreBank( unsigned char *timbres );
 
-/* Service the song stream (called from audio_update() once per frame). */
-void  music_update( void );
 
 /* The original menu code spells it Music_SetVolume (Watcom links case-insensitively). */
 #define Music_SetVolume MUSIC_SetVolume

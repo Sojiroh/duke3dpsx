@@ -36,17 +36,12 @@ tloadtile(short tilenume)
     gotpic[tilenume>>3] |= (1<<(tilenume&7));
 }
 
-/* PS1: tiles requested by cachespritenum(); docacheit() loads them before the wall/floor tiles so that the VRAM
-   budget never cuts off the sprites (a sprite with a missing tile is not drawn, a wall gets a placeholder) */
-static unsigned char spritetile[(MAXTILES+7)>>3];
-
 void cachespritenum(short i)
 {
     /* PS1: only the sprite's own tile is preloaded; animation frames, jibs and other related tiles
        stream in on demand (the VRAM cache is small and every CD seek costs ~100 ms). */
     if(ud.monsters_off && badguy(&sprite[i])) return;
     tloadtile(PN);
-    spritetile[PN>>3] |= 1<<(PN&7);
 }
 
 /* PS1: loading screen: percentage at the end of each stage of enterlevel() (see loadscreen.c); measured for
@@ -153,8 +148,11 @@ void cacheit(void)
 
 extern u32 tex_sector(int picnum);
 extern int tex_vram_pct(void);
-#define PRELOAD_BUDGET_PCT 39   /* % of VRAM the preload may add (was: up to 45% in total, with the 6% fonts resident) */
-#define PRELOAD_MAX 400
+/* % of VRAM the preload may add. The level group is ordered by distance from the start, so this buys the nearest
+   ~7 hops. E1L1 emulator runs: 39% = 440 vs level load, 111 misses in the first 120 frames; 55% = 500 vs, 86;
+   70% = 584 vs, 83 (load time grows ~4 vs per %, misses flatten). */
+#define PRELOAD_BUDGET_PCT 55
+#define PRELOAD_MAX 400         /* >= the most tiles any map requests (353, E3L8) */
 
 void docacheit(void)
 {
@@ -171,8 +169,9 @@ void docacheit(void)
         if( (gotpic[i>>3]&(1<<(i&7))) && tilesizx[i] > 0 && tilesizy[i] > 0)
             list[n++] = i;
 
-    /* insertion sort: sprite tiles first, each group by sector */
-#define PRELOAD_KEY(t) (tex_sector(t) | ((spritetile[(t)>>3]&(1<<((t)&7))) ? 0 : 0x80000000u))
+    /* insertion sort by disc sector: the level group (mkdata.py build_groups) stores the tiles nearest to the
+       player start first, so the budget is spent on what the first views need, sprites and walls alike */
+#define PRELOAD_KEY(t) tex_sector(t)
     for(i=1;i<n;i++)
     {
         k = list[i];
@@ -200,7 +199,6 @@ void docacheit(void)
     dbg("docacheit: %ld tiles requested, vram %d%%\n", n, tex_vram_pct());
 
     clearbufbyte(gotpic,sizeof(gotpic),0L);
-    clearbufbyte(spritetile,sizeof(spritetile),0L);
 }
 
 

@@ -251,45 +251,87 @@ def sprite_extra_tiles(N, pn):
     return ex
 
 
-def level_tile_set(board, tiles, N):
-    """Single source of truth for a level's group: every tile the level can ask for (map picnums,
-    their picanm animation ranges, cachespritenum() extras, tiles cachegoodsprites() loads each level)."""
-    base = set()
-    for s in board.sectors:
-        base.add(s[6]); base.add(s[12])
-        if s[6] == N["LA"]: base.update((N["LA"] + 1, N["LA"] + 2))
-        if s[12] == N["LA"]: base.update((N["LA"] + 1, N["LA"] + 2))
-    for w in board.walls:
-        base.add(w[6]); base.add(w[7])
-    ex = set()
+ALWAYS_RANK = -1      # HUD/font/weapon tiles cachegoodsprites() loads on every level
+FAR_RANK = 1 << 20    # referenced only by sectors the portal graph cannot reach from the player start
+
+
+def sector_hops(board, N):
+    """Hop count from the player's start sector to every sector: one hop per wall nextsector link, plus one per
+    teleporter jump (two sector effector sprites with lotag 7 and the same hitag; E1L1 starts in a closed room
+    that only a teleporter leaves). Sectors the walk never reaches are absent."""
+    ns = len(board.sectors)
+    adj = {}
+    tele = {}
+    for sp in board.sprites:   # sprite: [4] picnum, [13] sectnum, [20] lotag, [21] hitag
+        if sp[4] == N["SECTOREFFECTOR"] and sp[20] == 7 and 0 <= sp[13] < ns:
+            tele.setdefault(sp[21], set()).add(sp[13])
+    for sects in tele.values():
+        for a in sects:
+            adj.setdefault(a, set()).update(sects - {a})
+    hop = {board.cursectnum: 0} if 0 <= board.cursectnum < ns else {}
+    todo = list(hop)
+    for s in todo:
+        sec = board.sectors[s]
+        for n in [w[4] for w in board.walls[sec[0] : sec[0] + sec[1]]] + sorted(adj.get(s, ())):
+            if 0 <= n < ns and n not in hop:
+                hop[n] = hop[s] + 1
+                todo.append(n)
+    return hop
+
+
+def level_tile_ranks(board, tiles, N):
+    """Single source of truth for a level's group: {tile: rank} for every tile the level can ask for (map
+    picnums, their picanm animation ranges, cachespritenum() extras, tiles cachegoodsprites() loads each
+    level). rank = fewest portal/teleporter hops from the player start to a sector using the tile (walls, overwalls,
+    floor, ceiling, sprites); animation frames and cachespritenum() extras take the rank of their base tile;
+    the always-needed tiles get ALWAYS_RANK, tiles only used by unreachable sectors FAR_RANK."""
+    hop = sector_hops(board, N)
+    base = {}
+
+    def use(t, r):
+        if r < base.get(t, FAR_RANK + 1):
+            base[t] = r
+
+    for si, s in enumerate(board.sectors):
+        r = hop.get(si, FAR_RANK)
+        use(s[6], r); use(s[12], r)
+        if s[6] == N["LA"] or s[12] == N["LA"]:
+            use(N["LA"] + 1, r); use(N["LA"] + 2, r)
+        for w in board.walls[s[0] : s[0] + s[1]]:
+            use(w[6], r); use(w[7], r)
     for sp in board.sprites:
-        base.add(sp[4])
-        ex |= sprite_extra_tiles(N, sp[4])
-    base |= ex
-    base.add(N["BOTTOMSTATUSBAR"])
-    base.update(range(N["STARTALPHANUM"], N["ENDALPHANUM"] + 1))
-    base.update(range(N["FIRSTGUN"], N["FIRSTGUN"] + 3))
-    out = set()
-    for t in base:
-        out.add(t)
+        r = hop.get(sp[13], FAR_RANK)
+        use(sp[4], r)
+        for t in sprite_extra_tiles(N, sp[4]):
+            use(t, r)
+    for t in [N["BOTTOMSTATUSBAR"], *range(N["STARTALPHANUM"], N["ENDALPHANUM"] + 1),
+              *range(N["FIRSTGUN"], N["FIRSTGUN"] + 3)]:
+        base[t] = ALWAYS_RANK
+    out = {}
+    for t, r in base.items():
+        out[t] = min(r, out.get(t, r))
         tl = tiles.get(t)
         if tl is None:
             continue
         frames, typ = tl.picanm & 63, (tl.picanm >> 6) & 3
         if frames:
-            out.update(range(t - frames, t + 1) if typ == 3 else range(t, t + frames + 1))
+            for f in (range(t - frames, t + 1) if typ == 3 else range(t, t + frames + 1)):
+                out[f] = min(r, out.get(f, r))
     return out
 
 
 def build_groups(g, tiles, tilepix, data, pack, N):
     """Append per-level tile groups to the TILEDATA blob `data` (a bytearray) and add a TILEMAP_<MAP> entry
     for each map: records (u16 tile, u16 sector, u16 halfsector), sorted by tile, sectors relative to TILEDATA
-    (so texcache needs no change). Full-res pieces first (tile order = disc order for the preload), then the
-    half-res copies. Multi-piece tiles stay global. Returns {map: (first sector, sector count)}."""
+    (so texcache needs no change). Disc order: full-res pieces first, then the half-res copies, each ordered
+    by level_tile_ranks() (always-needed tiles, then by portal distance from the player start, then
+    unreachable ones; ties by tile number), so the preload and the streaming read the nearest tiles first.
+    Multi-piece tiles stay global. Returns {map: (first sector, sector count)}."""
     groups = {}
     for name in g.names(".MAP"):
         board = G.parse_map(g.read(name))
-        ts = sorted(t for t in level_tile_set(board, tiles, N) if t in tilepix)
+        rank = level_tile_ranks(board, tiles, N)
+        ts = sorted((t for t in rank if t in tilepix), key=lambda t: (rank[t], t))   # nearest first, ties by tile number
         first = len(data) // SECTOR
         sect, half = {}, {}
         for t in ts:
@@ -300,7 +342,7 @@ def build_groups(g, tiles, tilepix, data, pack, N):
                 half[t] = len(data) // SECTOR
                 data.extend(tilepix[t][1]); data.extend(b"\0" * (align(len(data)) - len(data)))
         assert len(data) // SECTOR < 65536, "TILEDATA with groups exceeds u16 sectors"
-        recs = b"".join(struct.pack("<HHH", t, sect[t], half.get(t, 0)) for t in ts)
+        recs = b"".join(struct.pack("<HHH", t, sect[t], half.get(t, 0)) for t in sorted(ts))
         mname = name[:-4]
         pack.add("TILEMAP_" + mname, recs)
         groups[mname] = (first, len(data) // SECTOR - first)

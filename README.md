@@ -152,8 +152,14 @@ Menus and screens:
   - Per-level tile groups: after the global tiles (still the fallback for every tile), `TILEDATA`
     holds one contiguous copy per map of the tiles that map can ask for (map picnums, their
     `picanm` animation ranges, the `cachespritenum()` extras, the HUD/weapon tiles; multi-piece
-    tiles excluded), full-res pieces first, then half-res copies. The `TILEMAP_<MAP>` pack entry
-    lists `(u16 tile, u16 sector, u16 halfsector)` records sorted by tile, sectors relative to
+    tiles excluded). Disc order inside a group: all full-res pieces first, then all half-res
+    copies; within each part the tiles are ordered by distance from the player start (the always
+    needed HUD/font/weapon tiles, then by hop count of the nearest sector using the tile: one hop per
+    portal `nextsector` link or SE 7 teleporter jump, animation frames and `cachespritenum()` extras
+    inheriting their base tile's hop count, tiles used only by unreachable sectors last; ties by
+    tile number), so the preload and the streaming read the nearest tiles first. The
+    `TILEMAP_<MAP>` pack entry lists `(u16 tile, u16 sector, u16 halfsector)` records sorted by
+    tile, sectors relative to
     `TILEDATA`. `loadpics_group()` (engine.c, called from `enterlevel()` and `loadplayer()`) re-reads
     `TILEIDX` and overlays the records, so streaming and the preload read one disc area per level
     instead of seeking over the 20 MB of tiles. Costs about 70 MB of disc space (`DUKE.DAT` ~99 MB).

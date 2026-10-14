@@ -298,12 +298,15 @@ void playmusic(char *fn)
     MUSIC_PlaySong( (unsigned char *)fn, MUSIC_LoopSong );
 }
 
-/* PS1: make the sound known to the SPU layer (called by precachenecessarysounds()). Small sounds
-   are preloaded into SPU RAM while the cache is mostly empty; everything else loads on first play. */
-#define PRELOAD_BUDGET (32*1024)
+/* PS1: make the sound known to the SPU layer (called by precachenecessarysounds()). Sounds of any size are
+   preloaded into SPU RAM (sync CD reads at level load) until 75% of the sample cache is used, so play
+   time CD reads are rare; the rest loads on first play. */
 
 static int sound_register(unsigned short num) { return sound_register2(num, 0); }
 
+#ifdef PS1_PROF
+static int sfx_preloaded;
+#endif
 char getsound(unsigned short num)
 {
     if(num >= NUM_SOUNDS || SoundToggle == 0) return 0;
@@ -311,11 +314,14 @@ char getsound(unsigned short num)
 
     if( sound_register2(num, 1) == 0 ) return 0;
 
-    if( ( (ud.level_number == 0 && ud.volume_number == 0 && (num == 189 || num == 232 || num == 99 || num == 233 || num == 17 ) ) ||
-          sfxdesc[num].size < 3072 ) && FX_CacheUsed() < PRELOAD_BUDGET )
+    if( (ud.level_number == 0 && ud.volume_number == 0 && (num == 189 || num == 232 || num == 99 || num == 233 || num == 17 ) ) ||
+        (FX_CacheUsed() + ((sfxdesc[num].size + 63) & ~63) <= (FX_CacheSize() / 4) * 3) )
     {
         Sound[num].lock = 2;
         FX_LoadSample(&sfxdesc[num]);
+#ifdef PS1_PROF
+        sfx_preloaded++;
+#endif
     }
     return 1;
 }
@@ -687,10 +693,16 @@ void clearsoundlocks(void)
 
 
 /* PS1: once per frame from the main loop: voices that finished by themselves are reported to
-   TestCallBack() (the SPU has no mixing thread/interrupt to do it), and the music stream is fed. */
+   TestCallBack() (the SPU has no mixing thread/interrupt to do it). */
+#ifdef PS1_PROF
+extern void fx_debug(void);
+extern void music_debug(void);
+#endif
 void audio_update(void)
 {
     if (ps1_audio_disabled) return;
     fx_update();
-    music_update();
+#ifdef PS1_PROF
+    { static int n; if (++n % 600 == 0) { fx_debug(); music_debug(); dbg("PROF sfx: preload calls %d\n", sfx_preloaded); } }
+#endif
 }
