@@ -336,7 +336,7 @@ int xyzsound(short num,short i,long x,long y,long z)
 
 //    if(num != 358) return 0;
 
-    if( num >= NUM_SOUNDS ||
+    if( (unsigned short)num >= NUM_SOUNDS ||
         FXDevice == NumSoundCards ||
         ( (soundm[num]&8) && ud.lockout ) ||
         SoundToggle == 0 ||
@@ -472,6 +472,7 @@ void sound(short num)
     int voice;
     long start;
 
+    if ((unsigned short)num >= NUM_SOUNDS) return;   /* PS1: NUM_SOUNDS is the real v1.3D count, not 450 */
     if (FXDevice == NumSoundCards) return;
     if(SoundToggle==0) return;
     if(VoiceToggle==0 && (soundm[num]&4) ) return;
@@ -521,6 +522,7 @@ int spritesound(unsigned short num, short i)
 
 void stopsound(short num)
 {
+    if((unsigned short)num >= NUM_SOUNDS) return;
     if(Sound[num].num > 0)
     {
         FX_StopSound(SoundOwner[num][Sound[num].num-1].voice);
@@ -532,6 +534,7 @@ void stopenvsound(short num,short i)
 {
     short j, k;
 
+    if((unsigned short)num >= NUM_SOUNDS) return;
     if(Sound[num].num > 0)
     {
         k = Sound[num].num;

@@ -1,6 +1,6 @@
-unsigned prof_drawalls, prof_ndrawalls;
 /* Extracted verbatim from Ken Silverman's ENGINE.C by tools/gen_engine.py, then hand-patched
    for the PS1 port. Do not regenerate without re-applying the patches. */
+
 
 void drawrooms(long daposx, long daposy, long daposz,
 			 short daang, long dahoriz, short dacursectnum)
@@ -107,6 +107,7 @@ void drawrooms(long daposx, long daposy, long daposz,
 		clearbuf((&tempbuf[0]),(long)((numbunches+3)>>2),0L);
 		tempbuf[0] = 1;
 
+		{ PROF_BEGIN(tb);
 		closest = 0;              //Almost works, but not quite :(
 		for(i=1;i<numbunches;i++)
 		{
@@ -121,8 +122,9 @@ void drawrooms(long daposx, long daposy, long daposz,
 			tempbuf[i] = 1;
 			if (j == 0) tempbuf[closest] = 1, closest = i, i = 0;
 		}
+		PROF_END(prof_bunch, tb); }
 
-		{ unsigned t = prof_now(); drawalls(closest); prof_drawalls += (prof_now()-t)&0xffff; }
+		{ PROF_BEGIN(t); drawalls(closest); PROF_END(prof_drawalls, t); }
 
 		if (automapping)
 		{
@@ -136,10 +138,9 @@ void drawrooms(long daposx, long daposy, long daposz,
 	}
 }
 
-unsigned prof_scan, prof_most, prof_bunch, prof_zslope;
 void scansector (short sectnum)
 {
-	unsigned prof_t0 = prof_now();
+	PROF_BEGIN(prof_t0);
 	walltype *wal, *wal2;
 	spritetype *spr;
 	long i, xs, ys, xp, yp, x1, y1, x2, y2, xp1, yp1, xp2, yp2, templong;
@@ -272,7 +273,7 @@ skipitaddwall:
 			bunchlast[z] = zz;
 		}
 	} while (sectorbordercnt > 0);
-	prof_scan += (prof_now() - prof_t0) & 0xffff;
+	PROF_END(prof_scan, prof_t0);
 }
 
 long wallfront (long l1, long l2)
@@ -319,12 +320,7 @@ long spritewallfront (spritetype *s, long w)
 	return (dmulscale32(wal->x-x1,s->y-y1,-(s->x-x1),wal->y-y1) >= 0);
 }
 
-static long bunchfront_i(long b1, long b2);
 long bunchfront (long b1, long b2)
-{
-	unsigned t = prof_now(); long r = bunchfront_i(b1,b2); prof_bunch += (prof_now()-t)&0xffff; return r;
-}
-static long bunchfront_i(long b1, long b2)
 {
 	long x1b1, x2b1, x1b2, x2b2, b1f, b2f, i;
 
@@ -355,13 +351,13 @@ void drawalls (long bunch)
 	sectnum = thesector[z]; sec = &sector[sectnum];
 
 	andwstat1 = 0xff; andwstat2 = 0xff;
-	{ unsigned t = prof_now();
+	{ PROF_BEGIN(t);
 	for(;z>=0;z=p2[z])  //uplc/dplc calculation
 	{
 		andwstat1 &= wallmost(uplc,z,sectnum,(char)0);
 		andwstat2 &= wallmost(dplc,z,sectnum,(char)1);
 	}
-	prof_most += (prof_now()-t)&0xffff; }
+	PROF_END(prof_most, t); }
 
 	if ((andwstat1&3) != 3)     //draw ceilings
 	{
@@ -697,10 +693,9 @@ void drawalls (long bunch)
 	}
 }
 
-unsigned prof_prep;
 void prepwall(long z, walltype *wal)
 {
-	unsigned prof_t0 = prof_now();
+	PROF_BEGIN(prof_t0);
 	long i, l, ol, splc, sinc, x, topinc, top, botinc, bot, hplc, walxrepeat;
 
 	walxrepeat = (wal->xrepeat<<3);
@@ -774,7 +769,7 @@ void prepwall(long z, walltype *wal)
 		walxrepeat--;
 		for(x=xb1[z];x<=xb2[z];x++) lwall[x] = walxrepeat-lwall[x];
 	}
-	prof_prep += (prof_now() - prof_t0) & 0xffff;
+	PROF_END(prof_prep, prof_t0);
 }
 
 
@@ -1127,10 +1122,9 @@ void drawmaskwall(short damaskwallcnt)
 	}
 }
 
-unsigned prof_nsprites, prof_sprite;
 void drawsprite (long snum)
 {
-	unsigned prof_t0 = prof_now(); prof_nsprites++;
+	PROF_COUNT(prof_nsprites, 1);
 	spritetype *tspr;
 	sectortype *sec;
 	long startum, startdm, sectnum, xb, yp, cstat;
@@ -3640,6 +3634,10 @@ void flushperms()
 void preparemirror(long dax, long day, long daz, short daang, long dahoriz, short dawall, short dasector, long *tposx, long *tposy, short *tang)
 {
 	long i, j, x, y, dx, dy;
+
+	/* PS1: the GPU back end cannot reverse the screen (completemirror is a no-op), so the mirror pass
+	   would only cost a frame's worth of CPU and primitive space; callers skip it via rend_mirrors_supported. */
+	if (!rend_mirrors_supported) return;
 
 	x = wall[dawall].x; dx = wall[wall[dawall].point2].x-x;
 	y = wall[dawall].y; dy = wall[wall[dawall].point2].y-y;

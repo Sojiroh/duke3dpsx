@@ -54,22 +54,25 @@ static void quiesce(void)
 		;
 }
 
-#define I_MASK_REG (*(volatile unsigned short *)0xbf801074)
 #define IRQ_T2 (1 << 6)
 static unsigned short held_mask;
 static int held;
+/* Timer 2 (music sequencer) stays masked from *_open to *_close, so the music voices are keyed off
+   first (music_hold): a card operation takes seconds and held notes would drone through it. */
 static void hold_irqs(void)
 {
 	if (held) return;
-	held_mask = I_MASK_REG & IRQ_T2;
-	I_MASK_REG &= ~IRQ_T2;
+	music_hold();
+	held_mask = IRQ_MASK & IRQ_T2;
+	IRQ_MASK &= ~IRQ_T2;
 	held = 1;
 }
 static void release_irqs(void)
 {
 	if (!held) return;
-	I_MASK_REG |= held_mask;
+	IRQ_MASK |= held_mask;
 	held = 0;
+	music_resume();
 }
 
 void mc_init(void)
@@ -121,9 +124,11 @@ int mc_status(void)
 	else if (r == EV_ERROR) st = MC_ERROR;
 	else {
 		st = MC_OK;
-		/* frame 0 must start with "MC"; a "new card" answer is repeated once */
+		/* frame 0 must start with "MC"; a "new card" answer is repeated once, after _new_card(): the
+		   card-change flag makes reads fail until the BIOS has been told about the new card (psx-spx) */
 		for (i = 0; i < 2; i++) {
 			stage[0] = stage[1] = 0;
+			if (i) _new_card();
 			_card_read(0, 0, stage);
 			r = card_wait(ev);
 			if (r == EV_NEW) continue;

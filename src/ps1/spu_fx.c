@@ -266,6 +266,7 @@ static void fx_free_sample(fx_sample *s)
 	if (s->slot && !slot_in_use(s->slot - 1)) slot_free(s->slot - 1);
 }
 
+#ifdef PS1_PROF
 void fx_debug(void)
 {
 	u32 used = 0;
@@ -281,6 +282,7 @@ void fx_debug(void)
 			    SPU_CH_FREQ(SPU_FIRSTFX + v), SPU_CH_VOL_L(SPU_FIRSTFX + v), SPU_CH_VOL_R(SPU_FIRSTFX + v),
 			    SPU_CH_ADSR1(SPU_FIRSTFX + v), SPU_CH_ADSR2(SPU_FIRSTFX + v));
 }
+#endif
 
 /* ------------------------------------------------------------------------------------------ */
 /* FX API                                                                                      */
@@ -293,7 +295,9 @@ void fx_debug(void)
 static u8 pan_left[NUMPANPOS][64], pan_right[NUMPANPOS][64];
 static int fx_installed, fx_volume = 255, fx_reverse, fx_reverb, fx_reverb_delay;
 static u32 fx_serial;
+#ifdef PS1_PROF
 static int fx_log_left = 8;     /* one-time diagnostics: the first few voices started */
+#endif
 static void (*fx_callback)(unsigned long);
 
 #define FX_VOICEMASK (((1u << 24) - 1) & ~((1u << SPU_FIRSTFX) - 1))
@@ -406,12 +410,14 @@ static int fx_play(fx_sample *s, int pitchoffset, int left, int right, int prior
 	SPU_CH_ADSR1(ch) = SPU_ADSR1_FLAT;
 	SPU_CH_ADSR2(ch) = SPU_ADSR2_FLAT;
 	spu_key_on(1u << ch);
+#ifdef PS1_PROF
 	if (fx_log_left > 0) {
 		fx_log_left--;
 		dbg("fx: play voice %d (spu ch %d) handle %d spu addr 0x%05x size %u rate %u pitch %04x l/r %d/%d clock %ld\n", idx, ch,
 		    (int)((v->serial << 5) | idx), (unsigned)c->addr, (unsigned)s->size, (unsigned)s->rate, (unsigned)pitch, v->l, v->r,
 		    fx_clock());
 	}
+#endif
 	return (int)((v->serial << 5) | idx);
 }
 

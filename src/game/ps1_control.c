@@ -9,13 +9,16 @@
  *    D-pad LEFT / RIGHT         Turn_Left / Turn_Right (strafe left/right while SQUARE is held)
  *    Left stick                 Y = forward/back, X = strafe (analog)
  *    Right stick                X = turn, Y = look up/down (analog, "mouse aiming" is always on)
- *    R1 Fire        L1 Jump        R2 Run (auto-run is on by default)      L2 Crouch
+ *    R1 Fire        L1 Jump        L2 Crouch
+ *    R2 toggles Auto-run (gamefunc_AutoRun; the game prints RUN MODE ON / RUN MODE OFF; default is run)
  *    CROSS Open/Use   CIRCLE Jump (alt)   TRIANGLE Next_Weapon   SQUARE Strafe modifier
  *    R3 Center_View   L3 Quick_Kick
  *    SELECT (modifier; a tap with nothing else pressed toggles the Map):
  *      SELECT+TRIANGLE Previous_Weapon   SELECT+LEFT/RIGHT Inventory_Left/Right
  *      SELECT+CROSS Inventory (use item)  SELECT+UP Jetpack   SELECT+DOWN MedKit
  *      SELECT+L1 Shrink_Screen   SELECT+R1 Enlarge_Screen   SELECT+START Pause
+ *      SELECT+L2 Aim_Up   SELECT+R2 Aim_Down (digital-pad pitch; held = keeps aiming, no auto-centre;
+ *                         does not clash with L2 Crouch / R2 Auto-run, which only act without SELECT)
  *    START                      Escape (opens/closes the menu)
  *
  *  Menus / screens (KB_* scancodes, KB_KeyWaiting/KB_Getch):
@@ -83,12 +86,25 @@ static int select_used;                      /* SELECT was used as a modifier si
 static int map_pulse;                        /* gamefunc_Map pending: stays set until the game calls CONTROL_ClearButton(Map) */
 static int pause_pulse;
 
+/* PS1: a key without an ASCII code is queued as the pair (0, scancode); push both or neither so a
+   full queue can never leave a lone 0 that KB_Getch would pair with an unrelated byte. */
+static int kbq_free(void)
+{
+    return KBQ_SIZE-1 - ((kbq_head-kbq_tail+KBQ_SIZE)%KBQ_SIZE);
+}
+
 static void kbq_push(unsigned char c)
 {
     int n = (kbq_head+1)%KBQ_SIZE;
     if(n == kbq_tail) return;
     kbq[kbq_head] = c;
     kbq_head = n;
+}
+
+static void kbq_push_ext(unsigned char sc)
+{
+    if(kbq_free() < 2) return;
+    kbq_push(0); kbq_push(sc);
 }
 
 static int gameplay_active(void)
@@ -124,7 +140,7 @@ void ps1_poll_input(void)
                 if(!game)
                 {
                     if(k->ascii) kbq_push(k->ascii);
-                    else { kbq_push(0); kbq_push(k->sc); }
+                    else kbq_push_ext(k->sc);
                 }
             }
             repeat_next[i] = totalclock + REPEAT_DELAY;
@@ -134,7 +150,7 @@ void ps1_poll_input(void)
             repeat_next[i] = totalclock + REPEAT_RATE;
             KB_KeyDown[k->sc] = 1;
             KB_LastScan = k->sc;
-            kbq_push(0); kbq_push(k->sc);
+            kbq_push_ext(k->sc);
         }
         if(released&k->mask)
         {
@@ -153,6 +169,9 @@ void ps1_poll_input(void)
     }
 
     if(pressed&PAD_SELECT) select_used = 0;
+    /* PS1: SELECT used as a modifier by ANY other button (CONTROL_GetInput only runs on game tics and
+       would miss quick taps / same-poll SELECT+START) -> not a Map tap */
+    if( (pad.btn&PAD_SELECT) && (pad.btn&~PAD_SELECT) ) select_used = 1;
     if( (released&PAD_SELECT) && !select_used && game ) map_pulse = 1;
 
     down_mask = pad.btn;
@@ -331,6 +350,8 @@ void CONTROL_GetInput( ControlInfo *info )
         if(b&PAD_DOWN)     { setfn(&raw1,&raw2,gamefunc_MedKit); select_used = 1; }
         if(b&PAD_L1)       { setfn(&raw1,&raw2,gamefunc_Shrink_Screen); select_used = 1; }
         if(b&PAD_R1)       { setfn(&raw1,&raw2,gamefunc_Enlarge_Screen); select_used = 1; }
+        if(b&PAD_L2)       { setfn(&raw1,&raw2,gamefunc_Aim_Up); select_used = 1; }
+        if(b&PAD_R2)       { setfn(&raw1,&raw2,gamefunc_Aim_Down); select_used = 1; }
     }
     else
     {
@@ -344,8 +365,8 @@ void CONTROL_GetInput( ControlInfo *info )
     }
     if(b&PAD_CIRCLE)   setfn(&raw1,&raw2,gamefunc_Jump);
     if(b&PAD_R1 && !sel) setfn(&raw1,&raw2,gamefunc_Fire);
-    if(b&PAD_R2)       setfn(&raw1,&raw2,gamefunc_Run);
-    if(b&PAD_L2)       setfn(&raw1,&raw2,gamefunc_Crouch);
+    if(b&PAD_R2 && !sel) setfn(&raw1,&raw2,gamefunc_AutoRun);   /* edge-toggled by the game (CONTROL_ClearButton) */
+    if(b&PAD_L2 && !sel) setfn(&raw1,&raw2,gamefunc_Crouch);
     if(b&PAD_R3)       setfn(&raw1,&raw2,gamefunc_Center_View);
     if(b&PAD_L3)       setfn(&raw1,&raw2,gamefunc_Quick_Kick);
     if(strafe)         setfn(&raw1,&raw2,gamefunc_Strafe);

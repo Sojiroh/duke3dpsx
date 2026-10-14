@@ -41,7 +41,6 @@ void video_represent(int on, int abr, int r, int g, int b);  /* draw the last pr
 void video_mark_overlay(void);      /* call right before appending the frame's tint overlay (see video_represent) */
 int video_frame(void);              /* frames flipped so far */
 int video_list_bytes(void);         /* bytes used in the current list (stats) */
-extern int video_dropped_prims;
 extern DRAWENV *video_drawenv;      /* current draw environment (for clip rect) */
 int video_vsync_count(void);        /* vblanks since boot */
 
@@ -56,9 +55,17 @@ typedef struct {
 int pak_init(void);
 const PakEntry *pak_find(const char *name);
 int pak_read(u32 sector, int nsectors, void *dst);           /* synchronous, dst must hold nsectors*2048 */
-int pak_read_async(u32 sector, int nsectors, void *dst, void (*done)(void)); /* 0 if busy/err */
+/* Asynchronous read; done(ok) runs in IRQ context: ok = 1 data valid, 0 = CD error or timeout (the read has been
+   cancelled and the drive is free again).  Returns 0 if the drive is busy or the read could not be started
+   (done is not called then). */
+int pak_read_async(u32 sector, int nsectors, void *dst, void (*done)(int ok));
 int pak_busy(void);
+void pak_tick(void);                /* vblank IRQ: async read timeout watchdog */
 int pak_read_bytes(const PakEntry *e, u32 offset, void *dst, u32 len); /* synchronous, arbitrary byte ranges via bounce */
+
+/* ---- spu_music.c: silence the sequencer without losing its position (memory card access) ---- */
+void music_hold(void);
+void music_resume(void);
 
 /* ---- pad.c ---- */
 typedef struct {

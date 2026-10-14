@@ -2,15 +2,25 @@
 """Headless PCSX-Redux test harness.
 
 Usage: emu.py [--iso build/duke3d.cue | --exe build/duke3d.exe] [--out DIR] [--timeout S]
-              [--memcard FILE] ACTION ...
-Actions (frame-scheduled, executed in order):
+              [--memcard FILE] [--watchdog N] [--dynarec] ACTION ...
+Actions (frame-scheduled, executed in order; a frame = one vsync):
   wait N            wait N frames
   press BTN[+BTN] N hold buttons for N frames (then release). BTN: CROSS CIRCLE SQUARE TRIANGLE
                     UP DOWN LEFT RIGHT L1 L2 R1 R2 START SELECT
   hold BTN[+BTN]    press and keep held;   release BTN[+BTN]
   shot NAME         save screenshot NAME.png in --out
-  quit              exit emulator
-Prints the game's TTY output. Exit code 0 when the script completed.
+  vram NAME         dump the whole VRAM as raw 16-bit pixels to NAME.vram in --out (no PNG)
+  pc N              print the CPU state (EXCEPTION ... (sample) lines, symbolized) every frame for N frames
+  prof N            sample the PC every frame for N frames and print a PROFILE histogram (by function and by caller)
+  quit              print the final CPU state + FPS and exit emulator
+Prints the game's TTY output.  Symbols (watchdog address, symbolizer, profile) come from the ELF next to
+--exe (duke3d.elf), or from $BUILD_DIR/duke3d.elf when only --iso is used.
+--watchdog N: the game's video_framecount is watched; after 240 frames without a new game frame a WATCHDOG
+line is printed and repeated every 40 frames; N such lines in a row (the count restarts whenever the game
+advances a frame) end the run with exit code 4 and hang.png.  A level load takes ~2000 frames, hence the
+default of 60.
+Exit code: 0 when the script completed (also at the end of the actions or after `quit`; no crash.png), 3 on a
+CPU exception (crash.png + EXCEPTION line), 4 watchdog, 124 --timeout.
 """
 import argparse
 import os
@@ -22,10 +32,11 @@ from PIL import Image
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 REDUX = os.path.join(ROOT, "tools/redux/PCSX-Redux-HEAD-x86_64.AppImage")
+ELF = os.path.join(ROOT, os.environ.get("BUILD_DIR", "build"), "duke3d.elf")  # set from --exe in main()
 
 
 def symbol_addr(name):
-    elf = os.path.join(ROOT, os.environ.get("BUILD_DIR", "build"), "duke3d.elf")
+    elf = ELF
     nm = os.path.join(ROOT, "tools/gcc/bin/mipsel-none-elf-nm")
     for l in subprocess.run([nm, elf], capture_output=True, text=True).stdout.splitlines():
         parts = l.split()
@@ -42,7 +53,7 @@ def gen_lua(actions, outdir, watch_addr=0, watchdog=12):
             lines.append("  {op='wait', n=%d}," % int(w[1]))
         elif w[0] in ("press", "hold", "release"):
             btns = ",".join("PCSX.CONSTS.PAD.BUTTON.%s" % b for b in w[1].split("+"))
-            n = int(w[2]) if w[0] == "press" else 0
+            n = max(1, int(w[2])) if w[0] == "press" else 0
             lines.append("  {op='%s', b={%s}, n=%d}," % (w[0], btns, n))
         elif w[0] == "shot":
             lines.append("  {op='shot', name='%s'}," % w[1])
@@ -83,7 +94,7 @@ end
 local function step()
   while true do
     local a = acts[idx]
-    if a == nil then PCSX.quit(0); return end
+    if a == nil then quitting = true; PCSX.quit(0); return end
     if left > 0 then left = left - 1; if left == 0 and holding then for _,b in ipairs(holding) do pad.clearOverride(b) end; holding = nil; idx = idx + 1 end; return end
     if a.op == 'wait' then left = a.n; idx = idx + 1; return
     elseif a.op == 'press' then for _,b in ipairs(a.b) do pad.setOverride(b) end; holding = a.b; left = a.n; return
@@ -116,12 +127,12 @@ function DrawImguiFrame() end
 keep_vsync = PCSX.Events.createEventListener('GPU::Vsync', function()
   frames = frames + 1
   local fc = framecount()
-  if fc ~= lastfc then lastfc = fc; stall = 0 else stall = stall + 1 end
+  if fc ~= lastfc then lastfc = fc; stall = 0; samples = 0 else stall = stall + 1 end  -- recovered stalls do not accumulate
   if lastfc > 0 and stall > 240 then
     local r = PCSX.getRegisters()
     print(string.format('EXCEPTION pc=%%08x ra=%%08x sp=%%08x (WATCHDOG: no frame for 240 vsyncs, frame %%d)', r.pc, r.GPR.n.ra, r.GPR.n.sp, lastfc))
     samples = samples + 1
-    if samples >= watchdog_limit then shot('hang'); PCSX.quit(4) end
+    if samples >= watchdog_limit then shot('hang'); quitting = true; PCSX.quit(4) end
     stall = 200
     return
   end
@@ -142,7 +153,7 @@ def symbolize(ln):
     if not ln.startswith("EXCEPTION"):
         return ln
     import bisect, re
-    elf = os.path.join(ROOT, os.environ.get("BUILD_DIR", "build"), "duke3d.elf")
+    elf = ELF
     nm = os.path.join(ROOT, "tools/gcc/bin/mipsel-none-elf-nm")
     syms = []
     for l in subprocess.run([nm, "-n", elf], capture_output=True, text=True).stdout.splitlines():
@@ -159,7 +170,7 @@ def symbolize(ln):
 
 def report_profile(samples):
     import bisect
-    elf = os.path.join(ROOT, os.environ.get("BUILD_DIR", "build"), "duke3d.elf")
+    elf = ELF
     nm = os.path.join(ROOT, "tools/gcc/bin/mipsel-none-elf-nm")
     syms = []
     for l in subprocess.run([nm, "-n", elf], capture_output=True, text=True).stdout.splitlines():
@@ -207,16 +218,21 @@ def raw_to_png(outdir, name):
 def main():
     ap = argparse.ArgumentParser()
     bd = os.environ.get("BUILD_DIR", "build")
+    global ELF
     ap.add_argument("--iso", default=os.path.join(ROOT, bd, "duke3d.cue"))
     ap.add_argument("--exe")
     ap.add_argument("--out", default=os.path.join(ROOT, bd, "shots"))
     ap.add_argument("--timeout", type=int, default=300)
     ap.add_argument("--memcard")
     ap.add_argument("--dynarec", action="store_true")
-    ap.add_argument("--watchdog", type=int, default=12,
-                    help="quit after N stall samples (one per ~40 vsyncs after 240 vsyncs without a frame); level loads need ~60")
+    ap.add_argument("--watchdog", type=int, default=60,
+                    help="quit (exit 4, hang.png) after N stall samples; the first comes after 240 vsyncs without a game frame, then one per 40 vsyncs")
     ap.add_argument("actions", nargs="*")
     args = ap.parse_args()
+    # the ELF (watchdog symbol, symbolizer, profile) must belong to the executable being run
+    ELF = os.path.splitext(os.path.abspath(args.exe))[0] + ".elf" if args.exe else os.path.join(ROOT, bd, "duke3d.elf")
+    if not os.path.exists(ELF):
+        print("warning: %s not found: no watchdog/symbols" % ELF, file=sys.stderr)
     os.makedirs(args.out, exist_ok=True)
     actions = args.actions or ["wait 300", "shot boot", "quit"]
     lua = os.path.join(args.out, "script.lua")

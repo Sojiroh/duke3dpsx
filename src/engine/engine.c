@@ -20,7 +20,19 @@
 #define MAXNODESPERLINE 42   //Warning: This depends on MAXYSAVES & MAXYDIM!
 
 long dmval;
-unsigned long slowdiv_count, slowdiv_site[4];
+#ifdef PS1_PROF
+/* PS1 debug: per-section engine timers (hblank ticks, TIMER1) / event counters printed by game.c's PF_REPORT */
+unsigned prof_drawalls, prof_scan, prof_most, prof_bunch, prof_prep, prof_sprite, prof_nsprites,
+         prof_wall, prof_plane, prof_nwall, prof_nplane, prof_nquad;
+unsigned pc_wcols, pc_wstrips, pc_pcols, pc_pstrips, pc_pverts, pc_spr, pc_sprcols;
+#define PROF_BEGIN(t)    unsigned t = prof_now()
+#define PROF_END(acc, t) ((acc) += (prof_now() - (t)) & 0xffff)
+#define PROF_COUNT(c, n) ((c) += (n))
+#else
+#define PROF_BEGIN(t)
+#define PROF_END(acc, t)
+#define PROF_COUNT(c, n)
+#endif
 long transarea = 0, totalarea = 0, beforedrawrooms = 1;
 static long oxdimen = -1, oviewingrange = -1, oxyaspect = -1;
 static long curbrightness = 0;

@@ -189,6 +189,7 @@ void setviewback(void);
 void squarerotatetile(short tilenume);
 void preparemirror(long dax, long day, long daz, short daang, long dahoriz, short dawall, short dasector, long *tposx, long *tposy, short *tang);
 void completemirror(void);
+extern int rend_mirrors_supported;   /* 0: the GPU back end cannot draw mirrors; the game skips its mirror pass */
 long animateoffs(short tilenum, short fakevar);
 long inside(long x, long y, short sectnum);
 long getangle(long xvect, long yvect);

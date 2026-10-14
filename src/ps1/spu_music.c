@@ -56,7 +56,7 @@ static u32 nblk, song_sector, song_sectors;
 static volatile u8 m_playing, m_paused, m_loop, m_stall;
 static volatile u32 m_wait, m_ticks;
 static int m_master = 255;
-static volatile u8 rd_inflight, rd_done, rd_slot;
+static volatile u8 rd_inflight, rd_done, rd_failed, rd_slot;
 static volatile u16 rd_blk;
 static u32 stat_stalls, stat_events, stat_blocks;
 
@@ -328,7 +328,8 @@ static void music_isr(void)
 /* main-thread side: stream prefetch                                                           */
 /* ------------------------------------------------------------------------------------------ */
 
-static void rd_cb(void) { rd_done = 1; }
+/* IRQ context; ok = 0: CD error or timeout (the ring slot stays invalid and is requested again) */
+static void rd_cb(int ok) { if (ok) rd_done = 1; else rd_failed = 1; }
 
 static u32 blk_sectors(u32 blk)
 {
@@ -341,13 +342,17 @@ void music_update(void)
 {
 	if (!m_playing || nblk <= 1) return;
 	if (rd_inflight) {
-		if (!rd_done) return;
-		slotblk[rd_slot] = rd_blk;
+		if (!rd_done && !rd_failed) return;
+		/* PS1: a failed read leaves the slot marked invalid (slotblk = 0xFFFF set when it was issued),
+		   so the code below requests the same block again */
+		if (rd_done) slotblk[rd_slot] = rd_blk;
 		rd_inflight = 0;
-		if (stat_blocks++ < 3)
+#ifdef PS1_PROF
+		if (rd_done && stat_blocks++ < 3)
 			dbg("music: streamed block %u/%u into ring slot %u (%u blocks so far, ticks %u, events %u, stalls %u)\n",
 			    (unsigned)rd_blk, (unsigned)nblk, (unsigned)rd_slot, (unsigned)stat_blocks, (unsigned)m_ticks,
 			    (unsigned)stat_events, (unsigned)stat_stalls);
+#endif
 	}
 	u32 other = cur_slot ^ 1;
 	u32 nxt = (cur_blk + 1 < nblk) ? cur_blk + 1 : 0;
@@ -355,7 +360,7 @@ void music_update(void)
 	slotblk[other] = 0xFFFF;
 	rd_slot = (u8)other;
 	rd_blk = (u16)nxt;
-	rd_done = 0;
+	rd_done = rd_failed = 0;
 	rd_inflight = 1;
 	if (!pak_read_async(song_sector + nxt * (BLK / 2048), blk_sectors(nxt), ring[other], rd_cb)) {
 		rd_inflight = 0;
@@ -469,6 +474,29 @@ void MUSIC_Pause(void)
 	ExitCriticalSection();
 }
 
+/* PS1: silence the sequencer for the duration of a memory card operation (Timer 2 is masked then, and
+   keyed-on voices would drone on).  Position and channel state are kept; notes that were sounding are
+   dropped, like MUSIC_Pause().  A pause requested by the game stays in force. */
+static u8 hold_set;
+void music_hold(void)
+{
+	if (!m_inited || hold_set) return;
+	EnterCriticalSection();
+	if (!m_paused) {
+		m_paused = 1;
+		mv_free_all();
+		hold_set = 1;
+	}
+	ExitCriticalSection();
+}
+
+void music_resume(void)
+{
+	if (!hold_set) return;
+	hold_set = 0;
+	m_paused = 0;
+}
+
 int MUSIC_StopSong(void)
 {
 	if (!m_inited) return MUSIC_Ok;
@@ -526,6 +554,7 @@ int MUSIC_PlaySong(unsigned char *song, int loopflag)
 
 void MUSIC_RegisterTimbreBank(unsigned char *timbres) { (void)timbres; }
 
+#ifdef PS1_PROF
 void music_debug(void)
 {
 	int act = 0;
@@ -539,3 +568,4 @@ void music_debug(void)
 			    mv[i].ch, mv[i].note, mv[i].vel, mv[i].region, SPU_CH_FREQ(i), SPU_CH_VOL_L(i), SPU_CH_VOL_R(i),
 			    SPU_CH_ADSR1(i), SPU_CH_ADSR2(i));
 }
+#endif

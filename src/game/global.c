@@ -85,15 +85,15 @@ struct player_struct ps[MAXPLAYERS];
 struct user_defs ud;
 
 char pus, pub;
-char syncstat, syncval[MAXPLAYERS][MOVEFIFOSIZ];
+char syncstat, syncval[MAXSYNCPLAYERS][MOVEFIFOSIZ];
 long syncvalhead[MAXPLAYERS], syncvaltail, syncvaltottail;
 
-input sync[MAXPLAYERS], loc;
+input sync[MAXSYNCPLAYERS], loc;
 input recsync[RECSYNCBUFSIZ];
 long avgfvel, avgsvel, avgavel, avghorz, avgbits;
 
 
-input inputfifo[MOVEFIFOSIZ][MAXPLAYERS];
+input inputfifo[MOVEFIFOSIZ][MAXSYNCPLAYERS];
 input recsync[RECSYNCBUFSIZ];
 
 long movefifosendplc;
@@ -152,10 +152,7 @@ char myjumpingtoggle, myonground, myhardlanding, myreturntocenter;
 signed char multiwho, multipos, multiwhat, multiflag;
 
 long fakemovefifoplc,movefifoplc;
-long myxbak[MOVEFIFOSIZ], myybak[MOVEFIFOSIZ], myzbak[MOVEFIFOSIZ];
-long myhorizbak[MOVEFIFOSIZ],dukefriction = 0xcc00, show_shareware;
-
-short myangbak[MOVEFIFOSIZ];
+long dukefriction = 0xcc00, show_shareware;   /* PS1: my*bak[] (multiplayer prediction) removed */
 char myname[32],camerashitable,freezerhurtowner=0,lasermode;
 // CTW - MODIFICATION
 // char networkmode = 255, movesperpacket = 1,gamequit = 0,playonten = 0,everyothertime;

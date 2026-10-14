@@ -62,6 +62,9 @@ Prepared for public release: 03/21/2003 - Charlie Wiederhold, 3D Realms
    input fifo (MOVEFIFOSIZ 256 -> 64) */
 #define RECSYNCBUFSIZ 24
 #define MOVEFIFOSIZ 64
+/* PS1: single player only (numplayers is fixed at 1): the per-player input/sync buffers hold player 0
+   only. ps[]/po[] keep MAXPLAYERS (level data and CON index them by player number) */
+#define MAXSYNCPLAYERS 1
 
 #define FOURSLEIGHT (1<<8)
 
@@ -96,7 +99,9 @@ struct player_struct; /* PS1: forward declaration (funct.h uses it before the de
 
 // #define GC (TICSPERFRAME*44)
 
-#define NUM_SOUNDS 450
+/* PS1: v1.3D's CON files define sounds 1..308 (checked against the GRP); sound()/xyzsound()/spritesound()
+   reject anything >= NUM_SOUNDS */
+#define NUM_SOUNDS 309
 
 /* PS1: sgn() was inline asm; ksgn() from pragmas.h gives the same result */
 #define sgn(x) ksgn(x)
@@ -142,7 +147,8 @@ struct player_struct; /* PS1: forward declaration (funct.h uses it before the de
 
 #define MAXANIMWALLS 512
 #define MAXINTERPOLATIONS 1024 /* PS1: was 2048 */
-#define NUMOFFIRSTTIMEACTIVE 192
+/* PS1: v1.3D defines quotes 0..121; the code writes 113/115/116/122 and reads up to 124 (FTA(124)) */
+#define NUMOFFIRSTTIMEACTIVE 128
 
 #define MAXCYCLERS 256
 #define MAXSCRIPTSIZE 12800 /* PS1: v1.3D CONs compile to 12132 longs (was 20460) */
@@ -251,7 +257,7 @@ typedef struct
     unsigned long bits;
 } input;
 
-extern input inputfifo[MOVEFIFOSIZ][MAXPLAYERS], sync[MAXPLAYERS];
+extern input inputfifo[MOVEFIFOSIZ][MAXSYNCPLAYERS], sync[MAXSYNCPLAYERS];
 extern input recsync[RECSYNCBUFSIZ];
 
 extern long movefifosendplc;
@@ -522,9 +528,6 @@ extern short myhoriz, omyhoriz, myhorizoff, omyhorizoff, globalskillsound;
 extern short myang, omyang, mycursectnum, myjumpingcounter;
 extern char myjumpingtoggle, myonground, myhardlanding,myreturntocenter;
 extern long fakemovefifoplc;
-extern long myxbak[MOVEFIFOSIZ], myybak[MOVEFIFOSIZ], myzbak[MOVEFIFOSIZ];
-extern long myhorizbak[MOVEFIFOSIZ];
-extern short myangbak[MOVEFIFOSIZ];
 
 extern short weaponsandammosprites[15];
 
@@ -550,7 +553,7 @@ extern char networkmode, movesperpacket;
 extern char gamequit;
 
 extern char pus,pub,camerashitable,freezerhurtowner,lasermode;
-extern char syncstat, syncval[MAXPLAYERS][MOVEFIFOSIZ];
+extern char syncstat, syncval[MAXSYNCPLAYERS][MOVEFIFOSIZ];
 extern signed char multiwho, multipos, multiwhat, multiflag;
 extern long syncvalhead[MAXPLAYERS], syncvaltail, syncvaltottail;
 extern long numfreezebounces,rpgblastradius,pipebombblastradius,tripbombblastradius,shrinkerblastradius,morterblastradius,bouncemineblastradius,seenineblastradius;

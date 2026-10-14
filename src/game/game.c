@@ -105,6 +105,20 @@ static void pf_jitter(void) { unsigned x = prof_now(), d = (unsigned)(rand() % 2
 #define PF_LAP(k) do { unsigned _n = prof_now(); pf_acc[k] += (_n - pf_t) & 0xffff; pf_t = _n; } while(0)
 static void PF_REPORT(void)
 {
+    /* MAXSPRITES headroom: peak number of live sprites, reported every 300 frames (this runs after
+       the last PF_LAP of the frame, so the scan is not part of the measured sections) */
+    {
+        static unsigned spr_peak, spr_all, spr_n;
+        int q, u = 0;
+        for(q=0;q<MAXSPRITES;q++) if(sprite[q].statnum != MAXSTATUS) u++;
+        if(u > spr_peak) spr_peak = u;
+        if(u > spr_all) spr_all = u;
+        if(++spr_n >= 300)
+        {
+            dbg("PROF sprites: peak %u of %d live in the last 300 frames (overall peak %u, now %d)\n",spr_peak,MAXSPRITES,spr_all,u);
+            spr_n = 0; spr_peak = 0;
+        }
+    }
     if(++pf_n < PF_FRAMES) return;
     dbg("PROF %d frames in %d vsyncs: input+move %u logic-end %u rooms %u rest %u nextpage %u (hblank ticks/frame x%d)\n",
         PF_FRAMES, video_vsync_count()-pf_v0, pf_acc[0]/PF_FRAMES, pf_acc[1]/PF_FRAMES, pf_acc[2]/PF_FRAMES,
@@ -450,6 +464,7 @@ void gamefaketimerhandler()
 
      if (numplayers < 2)
      {
+#if 0 /* PS1: unreachable (ud.multimode is always 1; computergetinput is compiled out) */
           if (ud.multimode > 1) for(i=connecthead;i>=0;i=connectpoint2[i])
               if(i != myconnectindex)
               {
@@ -458,6 +473,7 @@ void gamefaketimerhandler()
                       computergetinput(i,&inputfifo[movefifoend[i]&(MOVEFIFOSIZ-1)][i]);
                   movefifoend[i]++;
               }
+#endif
           return;
      }
 
@@ -2339,7 +2355,9 @@ void displayrooms(short snum,long smoothratio)
 
         se40code(cposx,cposy,cposz,cang,choriz,smoothratio);
 
-        if ((gotpic[MIRROR>>3]&(1<<(MIRROR&7))) > 0)
+        /* PS1: the GPU back end cannot draw mirrors: skip the extra drawrooms/animatesprites/drawmasks pass */
+        if (!rend_mirrors_supported) gotpic[MIRROR>>3] &= ~(1<<(MIRROR&7));
+        else if ((gotpic[MIRROR>>3]&(1<<(MIRROR&7))) > 0)
         {
             dst = 0x7fffffff; i = 0;
             for(k=0;k<mirrorcnt;k++)
@@ -5095,6 +5113,7 @@ char cheatquotes[NUMCHEATCODES][14] = {
 
 
 char cheatbuf[10],cheatbuflen;
+#if 0 /* PS1: unreachable: the cheat entry needs the keyboard scancodes sc_D/sc_N, which the pad never produces */
 void cheats(void)
 {
     short ch, i, j, k, keystate, weapon;
@@ -5545,6 +5564,11 @@ void cheats(void)
         }
     }
 }
+#else
+void cheats(void)
+{
+}
+#endif
 
 
 long nonsharedtimer;
@@ -6272,7 +6296,8 @@ int duke_main(void)
     ps1_started = 1;
     if(setjmp(ps1_restart))
     {
-        for(i=0;i<4;i++) kclose(i);
+        kcloseall();
+        ps1_inframe = 0;     /* quit is reached through menus() inside displayrest, with ps1_inframe set */
         ud.warp_on = 0;
         ud.eog = 0;
         ps[myconnectindex].gm = 0;
@@ -6506,7 +6531,9 @@ void ps1_pumpinput(void)
         gamefaketimerhandler();
         n++;
     }
-    if(n == 6) ototalclock = totalclock-TICSPERFRAME; /* far behind: drop the backlog */
+    /* far behind: drop the backlog, but only if the loop really did not catch up (otherwise one tic
+       would be added) */
+    if(n == 6 && totalclock >= ototalclock+TICSPERFRAME) ototalclock = totalclock-TICSPERFRAME;
 }
 
 char moveloop()
@@ -6515,8 +6542,10 @@ char moveloop()
 
     ps1_pumpinput();
 
+#if 0 /* PS1: unreachable (numplayers is always 1) */
     if (numplayers > 1)
         while (fakemovefifoplc < movefifoend[myconnectindex]) fakedomovethings();
+#endif
 
     getpackets();
 
@@ -6531,6 +6560,7 @@ char moveloop()
     return 0;
 }
 
+#if 0 /* PS1: unreachable (multiplayer prediction; numplayers is always 1) */
 void fakedomovethingscorrect(void)
 {
      long i;
@@ -7000,6 +7030,7 @@ ENDFAKEPROCESSINPUT:
 
         sprite[p->i].cstat = backcstat;
 }
+#endif
 
 
 char domovethings(void)
@@ -7178,7 +7209,9 @@ char domovethings(void)
         movefx();               //ST 11
     }
 
+#if 0 /* PS1: unreachable (numplayers is always 1) */
     fakedomovethingscorrect();
+#endif
 
     if( (everyothertime&1) == 0)
     {

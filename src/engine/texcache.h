@@ -26,5 +26,9 @@ int tex_vram_pct(void);                                /* % of cache VRAM in use
 void tex_frame(void);                                 /* call once per frame (LRU tick + streaming pump) */
 void tex_flush(void);                                 /* evict everything */
 void tex_lock(int picnum, int lock);                  /* keep resident (HUD etc.) */
-extern int tex_stat_resident, tex_stat_misses, tex_stat_loads;
+extern int tex_stat_resident, tex_stat_misses, tex_stat_loads, tex_stat_half;   /* half = resident half-res tiles */
+int tex_active_pct(void);                            /* % of cache VRAM used by the recent working set (half-res decision) */
+#ifdef PS1_PROF
+extern int tex_stat_halfloads, tex_stat_oldhalf;     /* debug: half-res loads actually chosen / chosen by the old vram_used rule */
+#endif
 int tex_vram_used(void);                             /* resident block texels */

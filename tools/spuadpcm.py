@@ -65,7 +65,7 @@ def _enc_block(xl, base, f, sh, s1, s2):
     return err, nib, s1, s2
 
 
-def encode(pcm, loop=False, loop_start_block=0):
+def encode(pcm, loop=False, loop_start_block=0, restart=False):
     """Encode int16 mono PCM to SPU-ADPCM (closed-loop choice of filter per block).
 
     loop=False: returns audio blocks + one silent terminator block (flag 0x01).
@@ -73,6 +73,10 @@ def encode(pcm, loop=False, loop_start_block=0):
                 0x04 and the last block 0x03, no terminator.  len(pcm) is padded to a multiple
                 of 28 (callers should pass loop lengths that already are).  The loop-start block
                 is encoded with filter 0 so that it does not depend on the history at the loop end.
+    restart=True (with loop=False): the runtime (spu_fx.c) turns the sound into a loop over blocks
+                0..last audio block by patching the flags; block 0 is then encoded with filter 0 so that
+                it does not depend on the history at the loop end (PS1: otherwise the SPU decodes it
+                from the tail samples and the seam clicks).
     Returns bytes."""
     x = np.asarray(pcm, dtype=np.int64)
     n = len(x)
@@ -86,7 +90,7 @@ def encode(pcm, loop=False, loop_start_block=0):
     s1 = s2 = 0
     for b in range(nblk):
         base = b * 28
-        if loop and b == loop_start_block:
+        if (loop and b == loop_start_block) or (restart and b == 0):
             cands = [(0, int(shifts[0][b]))]
         else:
             cands = []
@@ -139,6 +143,26 @@ def decode(data):
                 s2, s1 = s1, v
                 out.append(v)
     return np.array(out, dtype=np.int16)
+
+
+def pad_loop(pcm):
+    """PS1: length of a looping sound rounded up to a multiple of 28 (one ADPCM block) *without* a
+    zero gap at the loop seam.  The loop is treated as a cycle and resampled (linear, periodic) to the
+    padded length, so the sample after the last one is still the first one and the seam keeps exactly
+    the source's own wrap-around step.  The change in loop period is < 28 samples (pitch < 0.4 % for
+    the shipped VOCs).  Returns int64 numpy array; unchanged if the length already is a multiple of 28."""
+    p = np.asarray(pcm, dtype=np.int64)
+    n = len(p)
+    m = max(1, (n + 27) // 28) * 28
+    if m == n:
+        return p
+    if n == 0:
+        return np.zeros(m, dtype=np.int64)
+    x = np.arange(m, dtype=np.float64) * (n / m)
+    i = np.floor(x).astype(np.int64)
+    fr = x - i
+    pf = p.astype(np.float64)
+    return np.clip(np.round(pf[i % n] * (1 - fr) + pf[(i + 1) % n] * fr), -32768, 32767).astype(np.int64)
 
 
 def resample(x, src_rate, dst_rate):

@@ -10,16 +10,18 @@
  */
 
 #define MAXSTRIP 32
+#define MAXSPLIT_EXACT 8   /* exact period-boundary splits of non-pow2 tiles may recurse deeper than midpoint splits */
+#ifndef PRIM_RESERVE
+#define PRIM_RESERVE 6144  /* see prim_3d_full(); overridable with -DPRIM_RESERVE=... to test the 2D reserve */
+#endif
 #define MAXSPLIT 4
 
 typedef struct { short x, y; int u, v; unsigned char c; } QV;  /* u,v unwrapped texels; c brightness 0..128 */
 
 static u32 last_twin;
-unsigned prof_wall, prof_plane, prof_planeuv, prof_nwall, prof_nplane, prof_nquad;
-unsigned pc_wcols, pc_wstrips, pc_pcols, pc_pstrips, pc_pverts, pc_spr, pc_sprcols;
-static int rend_cliprect_set;
-static int rend_sync_loads;      /* 2D path: load missing tiles synchronously */
-int dbg_trace = 0;
+static int rend_sync_loads;      /* 2D path (rotatesprite): load missing tiles synchronously; also marks the 2D phase (no primitive reserve) */
+int rend_dropped_3d;             /* 3D strips/quads dropped because only the 2D/tint reserve was left (stat) */
+int rend_mirrors_supported = 0;  /* completemirror() cannot reverse the screen on the GPU path: the game skips its mirror pass */
 static int keepalive_frame = -1;
 static int keepalive_vsync;
 
@@ -36,8 +38,7 @@ void rend_keepalive(void)
 static const short bandcuts[] = {2,3,4,6,8,11,15,20,27,36,48,64,85,113,150,200,266};
 #define NBANDS ((int)(sizeof(bandcuts)/sizeof(bandcuts[0])))
 
-static int cur_offx, cur_offy;
-void begin_frame_bench(void);   /* current GPU drawing offset relative to the frame buffer */
+static int cur_offx, cur_offy;   /* current GPU drawing offset relative to the frame buffer */
 
 /* GPU drawing offset: 3D view primitives use window-relative coordinates */
 static void set_draw_offset(int x, int y)
@@ -76,9 +77,7 @@ void rend_represent(void)
 	if (!rend_represent_enabled) return;
 	if (k > 63) k = 63;
 	if ((r | g | b) == 0) { abr = 2; r = g = b = 63; } else abr = 1;   /* black: subtractive, else additive (as rend_draw_tint) */
-	if (dbg_trace) dbg("represent k=%d\n", k);
 	video_represent(k > 0, abr, r * 4 * k / 63, g * 4 * k / 63, b * 4 * k / 63);
-	if (dbg_trace) dbg("represent done\n");
 }
 
 static void rend_draw_tint(void)
@@ -106,15 +105,32 @@ static void rend_draw_tint(void)
 	prim_link(p);
 }
 
+#ifdef PS1_PROF
+/* PS1 debug: every 120 frames print texture-cache and primitive-buffer statistics */
+static void rend_prof_frame(void)
+{
+	static int n, maxbytes;
+	int b = video_list_bytes();
+	if (b > maxbytes) maxbytes = b;
+	if (++n < 120) return;
+	dbg("PROF tex: resident %d half-res %d vram %d%% active %d%% loads %d (half %d, old rule would be half %d) misses %d | prims: max list %d bytes, dropped 3D %d (reserve %d)\n",
+		tex_stat_resident, tex_stat_half, tex_vram_pct(), tex_active_pct(), tex_stat_loads, tex_stat_halfloads, tex_stat_oldhalf, tex_stat_misses,
+		maxbytes, rend_dropped_3d, PRIM_RESERVE);
+	n = 0; maxbytes = 0; rend_dropped_3d = 0;
+}
+#endif
+
 static void rend_end_frame(void)
 {
 	rend_draw_tint();
+#ifdef PS1_PROF
+	rend_prof_frame();
+#endif
 	video_wait_gpu();      /* GPU idle: texture uploads below execute immediately */
 	tex_frame();
 	clut_frame();
 	video_flip();
 	last_twin = 0;
-	rend_cliprect_set = 0;
 	cur_offx = cur_offy = 0;
 }
 
@@ -122,9 +138,14 @@ static void rend_end_frame(void)
 
 static inline int floordiv(int a, int b) { return (a >= 0) ? a / b : -((-a + b - 1) / b); }
 
+/* PS1: the 3D emitters stop PRIM_RESERVE bytes before the end of the primitive buffer so that the 2D
+   overlay emitted after the 3D pass (weapon, HUD, menus via rotatesprite, and the tint) always fits. */
+static inline int prim_3d_full(void) { return !rend_sync_loads && (prim_end - prim_cur) < PRIM_RESERVE; }
+
 static void emit_quad_final(const TexRef *ref, u16 clut, const QV *q, int trans, int gouraud, int ubase, int vbase, int uadd, int vadd)
 {
-	prof_nquad++;
+	if (prim_3d_full()) { rend_dropped_3d++; return; }
+	PROF_COUNT(prof_nquad, 1);
 	set_twin(ref->twin);
 	if (gouraud) {
 		POLY_GT4 *p = prim_alloc(sizeof(POLY_GT4));
@@ -241,11 +262,15 @@ static void emit_quad_pieces(const TexRef *ref, u16 clut, const QV *q, int trans
 		QV c[4];
 		if (piece < 0 || piece >= ref->npieces) return;
 		if (!(rend_sync_loads ? tex_lookup_sync(ref->picnum, piece, &pref) : tex_lookup(ref->picnum, piece, &pref))) return;
+		int ulim = (pref.u + pref.w <= 255) ? pref.w : pref.w - 1;   /* exclusive edge u==w is never sampled: allowed while the u8 coordinate fits */
+		int vlim = (pref.v + pref.h <= 255) ? pref.h : pref.h - 1;
 		for (i = 0; i < 4; i++) {
 			c[i] = q[i];
 			c[i].u -= pu * 256; c[i].v -= pv * 256;
-			if (c[i].u < 0) c[i].u = 0; if (c[i].u > pref.w - 1) c[i].u = pref.w - 1;
-			if (c[i].v < 0) c[i].v = 0; if (c[i].v > pref.h - 1) c[i].v = pref.h - 1;
+			if (c[i].u < 0) c[i].u = 0;
+			if (c[i].u > ulim) c[i].u = ulim;
+			if (c[i].v < 0) c[i].v = 0;
+			if (c[i].v > vlim) c[i].v = vlim;
 		}
 		emit_quad_final(&pref, clut, c, trans, gouraud, 0, 0, pref.u, pref.v);
 	}
@@ -257,6 +282,7 @@ static void emit_quad(const TexRef *ref, u16 clut, const QV *q, int trans, int g
 	int umin, umax, vmin, vmax, i, ubase, vbase, ulim, vlim, uadd, vadd, uneed, vneed;
 	int wrapw = (ref->w == ref->bw), wraph = (ref->h == ref->bh);
 	QV hq[4];
+	if (depth == 0 && prim_3d_full()) { rend_dropped_3d++; return; }
 
 	if (ref->half && depth == 0) {
 		for (i = 0; i < 4; i++) { hq[i] = q[i]; hq[i].u >>= 1; hq[i].v >>= 1; }
@@ -274,11 +300,11 @@ static void emit_quad(const TexRef *ref, u16 clut, const QV *q, int trans, int g
 		QV c[4];
 		int tw = ref->tw, th = ref->th;
 		ubase = floordiv(umin, tw) * tw; vbase = floordiv(vmin, th) * th;
-		if ((umax - ubase >= tw || vmax - vbase >= th) && depth < MAXSPLIT) {
+		if ((umax - ubase > tw || vmax - vbase > th) && depth < MAXSPLIT) {
 			QV a[4], b[4];
 			int k;
-			k = umax - ubase >= tw ? ubase + tw : vbase + th;
-			if (quad_split_level(q, k, umax - ubase < tw, a, b)) {
+			k = umax - ubase > tw ? ubase + tw : vbase + th;
+			if (quad_split_level(q, k, umax - ubase <= tw, a, b)) {
 				emit_quad(ref, clut, a, trans, gouraud, depth + 1);
 				emit_quad(ref, clut, b, trans, gouraud, depth + 1);
 				return;
@@ -287,35 +313,53 @@ static void emit_quad(const TexRef *ref, u16 clut, const QV *q, int trans, int g
 		for (i = 0; i < 4; i++) {
 			c[i] = q[i]; c[i].u -= ubase; c[i].v -= vbase;
 			if (c[i].u < 0) c[i].u = 0;
-			if (c[i].u >= tw) c[i].u = tw - 1;
+			if (c[i].u > tw) c[i].u = tw;      /* u == tw: exclusive edge */
 			if (c[i].v < 0) c[i].v = 0;
-			if (c[i].v >= th) c[i].v = th - 1;
+			if (c[i].v > th) c[i].v = th;
 		}
 		emit_quad_pieces(ref, clut, c, trans, gouraud, 0);
 		return;
 	}
 	if (wrapw) { ubase = umin & ~(ref->w - 1); ulim = 255; uadd = 0; }
-	else { ubase = floordiv(umin, ref->w) * ref->w; ulim = ref->w - 1; uadd = ref->u; }
+	else {
+		ubase = floordiv(umin, ref->w) * ref->w; uadd = ref->u;
+		/* PS1: the exclusive right edge (u == w) is never sampled, so it may sit on the period boundary
+		   without a split, as long as the 8-bit coordinate window holds it */
+		ulim = (ref->u + ref->w <= 255) ? ref->w : ref->w - 1;
+	}
 	if (wraph) { vbase = vmin & ~(ref->h - 1); vlim = 255; vadd = 0; }
-	else { vbase = floordiv(vmin, ref->h) * ref->h; vlim = ref->h - 1; vadd = ref->v; }
+	else {
+		vbase = floordiv(vmin, ref->h) * ref->h; vadd = ref->v;
+		vlim = (ref->v + ref->h <= 255) ? ref->h : ref->h - 1;
+	}
 	uneed = (umax - ubase > ulim);
 	vneed = (vmax - vbase > vlim);
-	if ((uneed || vneed) && depth < MAXSPLIT) {
+	if ((uneed || vneed) && depth < MAXSPLIT_EXACT) {
 		QV a[4], b[4];
-		int du_h = klabs(q[1].u - q[0].u) + klabs(q[3].u - q[2].u) + klabs(q[1].v - q[0].v) + klabs(q[3].v - q[2].v);
-		int du_v = klabs(q[2].u - q[0].u) + klabs(q[3].u - q[1].u) + klabs(q[2].v - q[0].v) + klabs(q[3].v - q[1].v);
-		if (du_h >= du_v && (q[1].x - q[0].x) > 1) {
-			/* split into left / right */
-			a[0] = q[0]; qv_mid(&a[1], &q[0], &q[1]); a[2] = q[2]; qv_mid(&a[3], &q[2], &q[3]);
-			b[0] = a[1]; b[1] = q[1]; b[2] = a[3]; b[3] = q[3];
-		} else if ((q[2].y - q[0].y) > 1 || (q[3].y - q[1].y) > 1) {
-			/* split into top / bottom */
-			a[0] = q[0]; a[1] = q[1]; qv_mid(&a[2], &q[0], &q[2]); qv_mid(&a[3], &q[1], &q[3]);
-			b[0] = a[2]; b[1] = a[3]; b[2] = q[2]; b[3] = q[3];
-		} else goto clamp;
-		emit_quad(ref, clut, a, trans, gouraud, depth + 1);
-		emit_quad(ref, clut, b, trans, gouraud, depth + 1);
-		return;
+		/* PS1: a non-power-of-2 axis repeats with period w (h): cut exactly at the period boundary so the
+		   repeat is seamless (midpoint splitting + clamping smeared the last texel of every repeat) */
+		if ((uneed && !wrapw && umax - ubase > ref->w && quad_split_level(q, ubase + ref->w, 0, a, b)) ||
+		    (vneed && !wraph && vmax - vbase > ref->h && quad_split_level(q, vbase + ref->h, 1, a, b))) {
+			emit_quad(ref, clut, a, trans, gouraud, depth + 1);
+			emit_quad(ref, clut, b, trans, gouraud, depth + 1);
+			return;
+		}
+		if (depth < MAXSPLIT) {
+			int du_h = klabs(q[1].u - q[0].u) + klabs(q[3].u - q[2].u) + klabs(q[1].v - q[0].v) + klabs(q[3].v - q[2].v);
+			int du_v = klabs(q[2].u - q[0].u) + klabs(q[3].u - q[1].u) + klabs(q[2].v - q[0].v) + klabs(q[3].v - q[1].v);
+			if (du_h >= du_v && (q[1].x - q[0].x) > 1) {
+				/* split into left / right */
+				a[0] = q[0]; qv_mid(&a[1], &q[0], &q[1]); a[2] = q[2]; qv_mid(&a[3], &q[2], &q[3]);
+				b[0] = a[1]; b[1] = q[1]; b[2] = a[3]; b[3] = q[3];
+			} else if ((q[2].y - q[0].y) > 1 || (q[3].y - q[1].y) > 1) {
+				/* split into top / bottom */
+				a[0] = q[0]; a[1] = q[1]; qv_mid(&a[2], &q[0], &q[2]); qv_mid(&a[3], &q[1], &q[3]);
+				b[0] = a[2]; b[1] = a[3]; b[2] = q[2]; b[3] = q[3];
+			} else goto clamp;
+			emit_quad(ref, clut, a, trans, gouraud, depth + 1);
+			emit_quad(ref, clut, b, trans, gouraud, depth + 1);
+			return;
+		}
 	}
 clamp:
 	if (uneed || vneed) {
@@ -335,17 +379,18 @@ clamp:
 /* untextured fallback while a tile is streaming in */
 static void emit_flat(const QV *q, u16 col15, int trans)
 {
-	POLY_G4 *p = prim_alloc(sizeof(POLY_G4));
+	POLY_G4 *p = prim_3d_full() ? NULL : prim_alloc(sizeof(POLY_G4));
 	int r = (col15 & 31) << 3, g = ((col15 >> 5) & 31) << 3, b = ((col15 >> 10) & 31) << 3, i;
-	if (!p) return;
+	if (!p) { rend_dropped_3d++; return; }
 	setPolyG4(p);
 	setXY4(p, q[0].x, q[0].y, q[1].x, q[1].y, q[2].x, q[2].y, q[3].x, q[3].y);
 	{
 		int c0 = q[0].c, c1 = q[1].c, c2 = q[2].c, c3 = q[3].c;
-		setRGB0(p, r * c0 >> 8, g * c0 >> 8, b * c0 >> 8);
-		setRGB1(p, r * c1 >> 8, g * c1 >> 8, b * c1 >> 8);
-		setRGB2(p, r * c2 >> 8, g * c2 >> 8, b * c2 >> 8);
-		setRGB3(p, r * c3 >> 8, g * c3 >> 8, b * c3 >> 8);
+		/* c is brightness 0..128 (128 = neutral) */
+		setRGB0(p, r * c0 >> 7, g * c0 >> 7, b * c0 >> 7);
+		setRGB1(p, r * c1 >> 7, g * c1 >> 7, b * c1 >> 7);
+		setRGB2(p, r * c2 >> 7, g * c2 >> 7, b * c2 >> 7);
+		setRGB3(p, r * c3 >> 7, g * c3 >> 7, b * c3 >> 7);
 	}
 	(void)i;
 	setSemiTrans(p, trans);
@@ -456,13 +501,14 @@ static void wall_spans(long x1, long x2, short *uwal, short *dwal, long *swal, l
 		top[x] = t; bot[x] = b;
 	}
 
-	pc_wcols += x2 - x1 + 1;
+	PROF_COUNT(pc_wcols, x2 - x1 + 1);
 	x = x1;
 	while (x <= x2) {
 		long swa, swr, ua, ur;
 		QV q[4];
 		int topL, botL, topR, botR;
 		if (top[x] >= bot[x]) { x++; continue; }
+		if (prim_3d_full()) { rend_dropped_3d++; return; }
 		xa = x; xb = x;
 		swa = swal[xa];
 		while (xb + 1 <= x2 && (xb + 1 - xa) < MAXSTRIP) {
@@ -477,7 +523,7 @@ static void wall_spans(long x1, long x2, short *uwal, short *dwal, long *swal, l
 			xb = xn;
 		}
 		xb = strip_fit(top, bot, x2, xa, xb);
-		xr = xb + 1; pc_wstrips++;
+		xr = xb + 1; PROF_COUNT(pc_wstrips, 1);
 		topL = top[xa]; botL = bot[xa];
 		if (xb + 1 <= x2 && top[xb + 1] < bot[xb + 1]) { topR = top[xb + 1]; botR = bot[xb + 1]; }
 		else if (xb > xa) { topR = 2 * top[xb] - top[xb - 1]; botR = 2 * bot[xb] - bot[xb - 1]; }
@@ -495,7 +541,6 @@ static void wall_spans(long x1, long x2, short *uwal, short *dwal, long *swal, l
 		q[1].x = xr << REND_XSHIFT; q[1].y = topR; q[1].u = ur; q[1].v = wall_v(swr, topR); q[1].c = wall_bright(swr);
 		q[2].x = xa << REND_XSHIFT; q[2].y = botL; q[2].u = ua; q[2].v = wall_v(swa, botL); q[2].c = q[0].c;
 		q[3].x = xr << REND_XSHIFT; q[3].y = botR; q[3].u = ur; q[3].v = wall_v(swr, botR); q[3].c = q[1].c;
-		/* keep v consistent across the strip: express right column v relative to the left (globalzd cancels) */
 		if (have) emit_quad(&ref, clut, q, trans, 1, 0);
 		else if (mode == 0) emit_flat(q, tileavg[globalpicnum], 0);
 		x = xb + 1;
@@ -504,9 +549,9 @@ static void wall_spans(long x1, long x2, short *uwal, short *dwal, long *swal, l
 
 static void wallscan(long x1, long x2, short *uwal, short *dwal, long *swal, long *lwal)
 {
-	unsigned t = prof_now();
+	PROF_BEGIN(t);
 	wall_spans(x1, x2, uwal, dwal, swal, lwal, 0);
-	prof_wall += (prof_now() - t) & 0xffff; prof_nwall++;
+	PROF_END(prof_wall, t); PROF_COUNT(prof_nwall, 1);
 }
 
 static void maskwallscan(long x1, long x2, short *uwal, short *dwal, long *swal, long *lwal)
@@ -588,7 +633,7 @@ static void plane_uv(long x, long y, int *u, int *v, int *c)
 static inline void plane_vertex(QV *q, long x, long y)
 {
 	int u, v, c;
-	pc_pverts++;
+	PROF_COUNT(pc_pverts, 1);
 	plane_uv(x, y, &u, &v, &c);
 	q->x = x << REND_XSHIFT; q->y = y; q->u = u; q->v = v; q->c = c;
 }
@@ -643,12 +688,13 @@ static void plane_spans(long x1, long x2, const short *top, const short *bot, in
 	have = tex_lookup(globalpicnum, 0, &ref);
 	clut = clut_get(globalpal, !trans && pm_mode != PM_FLOORSPRITE);
 
-	pc_pcols += x2 - x1 + 1;
+	PROF_COUNT(pc_pcols, x2 - x1 + 1);
 	vc_prev->x = -1; vc_cur->x = -1;
 	x = x1;
 	while (x <= x2) {
 		int topL, botL, topR, botR, yT, yB, i, c0, c1;
 		if (top[x] >= bot[x]) { x++; continue; }
+		if (prim_3d_full()) { rend_dropped_3d++; return; }
 		xa = x; xb = x;
 		while (xb + 1 <= x2 && (xb + 1 - xa) < MAXSTRIP) {
 			long xn = xb + 1;
@@ -660,7 +706,7 @@ static void plane_spans(long x1, long x2, const short *top, const short *bot, in
 			xb = xn;
 		}
 		xb = strip_fit(top, bot, x2, xa, xb);
-		xr = xb + 1; pc_pstrips++;
+		xr = xb + 1; PROF_COUNT(pc_pstrips, 1);
 		topL = top[xa]; botL = bot[xa];
 		if (xb + 1 <= x2 && top[xb + 1] < bot[xb + 1]) { topR = top[xb + 1]; botR = bot[xb + 1]; }
 		else if (xb > xa) { topR = 2 * top[xb] - top[xb - 1]; botR = 2 * bot[xb] - bot[xb - 1]; }
@@ -794,7 +840,7 @@ void ceilscan(long x1, long x2, long sectnum)
 		if (b > ydimen) b = ydimen;
 		top[x] = t; bot[x] = b;
 	}
-	{ unsigned t = prof_now(); plane_spans(x1, x2, top, bot, (globalorientation & 0x180) >= 256); prof_plane += (prof_now() - t) & 0xffff; prof_nplane++; }
+	{ PROF_BEGIN(t); plane_spans(x1, x2, top, bot, (globalorientation & 0x180) >= 256); PROF_END(prof_plane, t); PROF_COUNT(prof_nplane, 1); }
 }
 
 void florscan(long x1, long x2, long sectnum)
@@ -825,7 +871,7 @@ void florscan(long x1, long x2, long sectnum)
 		if (b > ydimen) b = ydimen;
 		top[x] = t; bot[x] = b;
 	}
-	{ unsigned t = prof_now(); plane_spans(x1, x2, top, bot, (globalorientation & 0x180) >= 256); prof_plane += (prof_now() - t) & 0xffff; prof_nplane++; }
+	{ PROF_BEGIN(t); plane_spans(x1, x2, top, bot, (globalorientation & 0x180) >= 256); PROF_END(prof_plane, t); PROF_COUNT(prof_nplane, 1); }
 }
 
 /* floor sprites: drawsprite already computed uwall/dwall and the mapping globals */
@@ -1060,19 +1106,26 @@ static void dorotatesprite(long sx, long sy, long z, short a, short picnum, sign
 	trans = (dastat & 1) != 0;
 	clut = clut_get(dapalnum, 0);
 	rend_sync_loads = 1;
-	if (dbg_trace) dbg("rotatesprite pic %d dastat %d\n", picnum, dastat);
 	{
 		TexRef ref;
 		QV q[4];
 		int k;
 		if (!tex_lookup_sync(picnum, 0, &ref)) { if (clipped) set_cliprect(0, 0, xdim - 1, ydim - 1); return; }
+		int ufar = xsiz, vfar = ysiz;
+		/* PS1: far corners sit on the exclusive edge xsiz/ysiz so a 1:1 glyph samples every texel (the GPU
+		   reads texel floor(u) at a pixel's left/top edge); -1 only if the 8-bit window cannot hold it */
+		if (ref.npieces == 1) {
+			int hw = xsiz >> ref.half, hh = ysiz >> ref.half;
+			if (ref.w == ref.bw ? hw > 255 : ref.u + hw > 255) ufar--;
+			if (ref.h == ref.bh ? hh > 255 : ref.v + hh > 255) vfar--;
+		}
 		/* corners: 0 TL, 1 TR, 3 BL, 2 BR of the whole tile */
 		for (k = 0; k < 4; k++) {
 			int c = (k == 0) ? 0 : (k == 1) ? 1 : (k == 2) ? 3 : 2;
 			q[k].x = px[c] >> 16; q[k].y = py[c] >> 16;
-			q[k].u = (k == 0 || k == 2) ? 0 : xsiz - 1;
-			q[k].v = (k < 2) ? 0 : ysiz - 1;
-			if (dastat & 4) q[k].v = ysiz - 1 - q[k].v;
+			q[k].u = (k == 0 || k == 2) ? 0 : ufar;
+			q[k].v = (k < 2) ? 0 : vfar;
+			if (dastat & 4) q[k].v = (k < 2) ? ysiz - 1 : 0;   /* y-flipped: top row first (texel floor(v) samples) */
 			q[k].c = bright;
 		}
 		emit_quad(&ref, clut, q, trans, 0, 0);
@@ -1164,29 +1217,5 @@ void rotatesprite(long sx, long sy, long z, short a, short picnum, signed char d
 
 void completemirror(void)
 {
-	/* mirrors are not supported on the GPU path yet: the mirror wall keeps its texture */
+	/* mirrors are not supported on the GPU path (rend_mirrors_supported == 0): the mirror wall keeps its texture */
 }
-
-void rend_bench(void)
-{
-	TexRef ref; QV q[4]; unsigned t; int i, u, v, c;
-	if (!tex_lookup(89, 0, &ref)) { dbg("bench: no tex\n"); return; }
-	for (i = 0; i < 4; i++) { q[i].x = (i&1)*24; q[i].y = (i>>1)*100; q[i].u = 14 + (i&1)*3; q[i].v = 60 + (i>>1)*100; q[i].c = 100; }
-	t = prof_now();
-	for (i = 0; i < 2000; i++) { emit_quad_final(&ref, 0x7800, q, 0, 1, 0, 0, 0, 0); if ((i & 63) == 63) { video_wait_gpu(); begin_frame_bench(); } }
-	dbg("bench emit_quad_final x2000: %u ticks\n", (prof_now() - t) & 0xffff);
-	t = prof_now();
-	for (i = 0; i < 2000; i++) { emit_quad(&ref, 0x7800, q, 0, 1, 0); if ((i & 63) == 63) { video_wait_gpu(); begin_frame_bench(); } }
-	dbg("bench emit_quad x2000: %u ticks\n", (prof_now() - t) & 0xffff);
-	pm_mode = PM_FLAT; pm_xbits = 6; pm_ybits = 6; globalx1 = 12345; globaly1 = 777; globalx2 = 4567; globaly2 = 888; globalxpanning = 5; globalypanning = 6; globvis = 614; globalshade = 4; globalhoriz = 120;
-	t = prof_now();
-	for (i = 0; i < 2000; i++) { plane_uv(i & 255, (i >> 3) & 255, &u, &v, &c); }
-	dbg("bench plane_uv x2000: %u ticks (%d %d %d)\n", (prof_now() - t) & 0xffff, u, v, c);
-	t = prof_now();
-	for (i = 0; i < 2000; i++) { c = wall_bright(40000 + i); v += wall_v(40000 + i, i & 255); }
-	dbg("bench wall_bright+wall_v x2000: %u ticks (%d %d)\n", (prof_now() - t) & 0xffff, v, c);
-	t = prof_now();
-	for (i = 0; i < 2000; i++) { TexRef r2; tex_lookup(89 + (i & 1), 0, &r2); c += clut_get(i & 1, 1); }
-	dbg("bench tex_lookup+clut_get x2000: %u ticks (%d)\n", (prof_now() - t) & 0xffff, c);
-}
-

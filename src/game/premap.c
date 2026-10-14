@@ -1158,7 +1158,7 @@ void clearfifo(void)
     clearbufbyte(myminlag,MAXPLAYERS<<2,0L);
     clearbufbyte(&loc,sizeof(input),0L);
     clearbufbyte(&sync[0],sizeof(sync),0L);
-    clearbufbyte(inputfifo,sizeof(input)*MOVEFIFOSIZ*MAXPLAYERS,0L);
+    clearbufbyte(inputfifo,sizeof(inputfifo),0L);   /* PS1: sized for MAXSYNCPLAYERS */
 
     clearbuf(movefifoend,MAXPLAYERS,0L);
     clearbuf(syncvalhead,MAXPLAYERS,0L);

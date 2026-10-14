@@ -3961,6 +3961,7 @@ static long fdmatrix[12][12] =
      128, 128, 128, 128,2560, 128,2560,2560, 128, 128, 128, 128,   //EXPA
 };
 
+#if 0 /* PS1: unreachable: computergetinput only runs for bot players (multiplayer) */
 static long goalx[MAXPLAYERS], goaly[MAXPLAYERS], goalz[MAXPLAYERS];
 static long goalsect[MAXPLAYERS], goalwall[MAXPLAYERS], goalsprite[MAXPLAYERS];
 static long goalplayer[MAXPLAYERS], clipmovecount[MAXPLAYERS];
@@ -4333,4 +4334,5 @@ void computergetinput(long snum, input *syn)
         syn->avel = min(max((((daang+1024-damyang)&2047)-1024)>>3,-127),127);
     }
 }
+#endif
 

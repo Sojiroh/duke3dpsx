@@ -96,3 +96,9 @@ void kclose(long handle)
 	if ((unsigned)handle >= MAXHANDLES) return;
 	files[handle].e = NULL;
 }
+
+/* closes every open handle (game restart after gameexit()'s longjmp) */
+void kcloseall(void)
+{
+	for (int i = 0; i < MAXHANDLES; i++) files[i].e = NULL;
+}

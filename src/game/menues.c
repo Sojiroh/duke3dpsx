@@ -164,7 +164,7 @@ int loadplayer(signed char spot)
 {
     short k,music_changed;
     long i, x;
-    int rc;
+    int rc, ingame;
 
     if(spot < 0)
     {
@@ -178,7 +178,26 @@ int loadplayer(signed char spot)
 
     music_changed = (music_select != (ud.volume_number*11) + ud.level_number);
 
+    ingame = (ps[myconnectindex].gm&MODE_GAME) != 0;   /* before sg_read: a decode overwrites ps[].gm */
     rc = sg_read(spot);
+    if(rc == SG_DESTROYED)
+    {
+        /* PS1: the decode failed after the world and players were overwritten (ud.volume/level/skill
+           were NOT committed). Never go on with the half-restored state: re-enter the current level the
+           same way the death/restart path does (main loop: MODE_RESTART -> enterlevel). With no game in
+           progress (loading from the title menu) the garbage is never run: newgame() resets everything. */
+        dbg("loadplayer: slot %d corrupt after decode (%s), %s\n",spot,sg_error,
+            ingame ? "restarting the level" : "back to the menu");
+        if(ingame)
+        {
+            FX_StopAllSounds();
+            clearsoundlocks();
+            ps[myconnectindex].gm = MODE_RESTART;
+        }
+        ready2send = 1;
+        ototalclock = totalclock;
+        return rc;
+    }
     if(rc != 0)
     {
         if(rc == 1) FTA(114,&ps[myconnectindex]);

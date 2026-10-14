@@ -6,7 +6,8 @@ Pack entries produced by add_music(g, pack):
   <NAME>.MID (aux = length)  one MSQ1 event stream per song
 
 Formats are documented next to the writers (write_song / build_bank).  Python 3 + numpy only.
-Usage:  python3 tools/mkmusic.py <DUKE3D.GRP> [--selftest]
+Usage:  python3 tools/mkmusic.py <DUKE3D.GRP> [--sf2 FILE.sf2] [--selftest]
+  --sf2 FILE   take the instrument samples from this SoundFont (never searched for); default: built-in synthesis
 """
 import bisect
 import importlib.util
@@ -163,10 +164,50 @@ class Song:
         self.events = []
         self.loop_tick = 0
         self.notes = []  # (tick, ch, note, vel, dur, program)
+        self.dropped = {}  # EMIDI-designated tracks removed: {track: (reason, note-ons)}
+
+
+# EMIDI track designation (Apogee EMIDI as implemented by upstream/audiolib/SOURCE/MIDI.C
+# _MIDI_InitEMIDI and _MIDI.H): CC110 = "include track" and CC111 = "exclude track" carry a device
+# id; 127 (EMIDI_ALL_CARDS) matches every device, otherwise the id must equal the playback device
+# type.  Device ids: 0 General MIDI, 1 Sound Canvas, 2 AWE32, 3 WaveBlaster, 4 Sound Blaster,
+# 5 Pro Audio, 6 Sound Man 16, 7 Adlib, 8 Soundscape, 9 Ultrasound.
+# PS1: the SPU bank plays General MIDI, so the port emulates device 0 (GenMidi).
+EMIDI_DEVICE = 0
+EMIDI_ALL_CARDS = 127
+EMIDI_INCLUDE_TRACK, EMIDI_EXCLUDE_TRACK = 110, 111
+EMIDI_DEVICE_NAMES = ("GeneralMIDI", "SoundCanvas", "AWE32", "WaveBlaster", "SoundBlaster", "ProAudio",
+                      "SoundMan16", "Adlib", "Soundscape", "Ultrasound")
+
+
+def emidi_dropped_tracks(evs, device=EMIDI_DEVICE):
+    """Tracks audiolib would deactivate for `device`: {trk: reason}.  Same state machine as
+    _MIDI_InitEMIDI, in file order per track: a matching CC110 includes the track; a non-matching
+    CC110 excludes it only if no CC110 was seen before; a matching CC111 excludes it.  A track without
+    either controller stays included."""
+    include, found, why = {}, {}, {}
+    for tk, trk, seq, typ, ch, a, b in evs:  # evs is sorted by (tick, trk, seq): file order per track
+        if typ != "cc" or a not in (EMIDI_INCLUDE_TRACK, EMIDI_EXCLUDE_TRACK):
+            continue
+        hit = b == EMIDI_ALL_CARDS or b == device
+        if a == EMIDI_INCLUDE_TRACK:
+            if hit:
+                found[trk], include[trk] = True, True
+            elif not found.get(trk):
+                found[trk], include[trk] = True, False
+                why[trk] = "CC110=%d" % b
+        elif hit:
+            include[trk] = False
+            why[trk] = "CC111=%d" % b
+    return {t: why[t] for t, inc in include.items() if not inc}
 
 
 def convert_midi(data):
     div, evs, end_midi = parse_midi(data)
+    dropped = emidi_dropped_tracks(evs)
+    song_dropped = {t: (why, sum(1 for e in evs if e[1] == t and e[3] == "on")) for t, why in dropped.items()}
+    if dropped:
+        evs = [e for e in evs if e[1] not in dropped]  # audiolib never plays these tracks (not even their controllers)
     tm = TempoMap(div, evs)
     # per-channel state
     st = [dict(DEFAULTS) for _ in range(16)]
@@ -246,6 +287,7 @@ def convert_midi(data):
             end120 = max(end120, o[7])
         end120 = max(end120, o[0])
     song = Song()
+    song.dropped = song_dropped  # {track: (reason, note-ons)} removed by EMIDI designation
     for o in out:
         if o[3] == EV_NOTE:
             off = o[7] if len(o) > 7 else end120
@@ -363,7 +405,7 @@ def verify_stream(blob):
     return dict(notes=notes, ticks=length, counts=cnt)
 
 
-def ref_midi_stats(data):
+def ref_midi_stats(data, skip=()):
     """Independent (simple) MIDI reader: returns (note_on_count, [(sec, ch, note, vel)], end_sec_of_last_note_or_eot)."""
     div = struct.unpack(">H", data[12:14])[0]
     ntrk = struct.unpack(">H", data[10:12])[0]
@@ -371,7 +413,8 @@ def ref_midi_stats(data):
     tempos = [(0, 500000)]
     raw = []
     eot = 0
-    for _ in range(ntrk):
+    for trk in range(ntrk):
+        mark = (len(raw), len(tempos))
         assert data[p:p + 4] == b"MTrk"
         ln = int.from_bytes(data[p + 4:p + 8], "big")
         q, e, t, rs = p + 8, p + 8 + ln, 0, 0
@@ -416,6 +459,8 @@ def ref_midi_stats(data):
                     raw.append((t, rs & 15, data[q], data[q + 1]))
                 q += n
         eot = max(eot, t)
+        if trk in skip:  # EMIDI-excluded track: audiolib never plays it (notes and tempo changes)
+            del raw[mark[0]:], tempos[mark[1]:]
         p += 8 + ln
     tempos.sort(key=lambda x: x[0])
 
@@ -435,7 +480,7 @@ def selftest_songs(g, songs):
     tot_notes = 0
     for name, (song, blob) in songs.items():
         info = verify_stream(blob)
-        n_ref, ref_notes, eot_sec = ref_midi_stats(g.read(name))
+        n_ref, ref_notes, eot_sec = ref_midi_stats(g.read(name), skip=set(song.dropped))
         assert len(info["notes"]) == n_ref == len(song.notes), (name, len(info["notes"]), n_ref)
         got = sorted(info["notes"])
         # every note start must match the reference time within 1 tick
@@ -605,17 +650,6 @@ class SF2:
         root = z.rootKey if z.rootKey >= 0 else (pitch if pitch <= 127 else 60)
         fine = corr + z.coarseTune * 100 + z.fineTune
         return pcm, ls2, le2, looped, rate, root, fine
-
-
-def find_sf2():
-    env = os.environ.get("DUKE_SF2")
-    if env is not None:
-        return None if env.lower() == "none" else env
-    for p in ("/home/sojiroh/Games/DooM/gzdoom/soundfonts/gzdoom.sf2",
-              "/home/sojiroh/Games/DooM/DSC-1.0.1/DSC-1.0/data/soundfonts/gzdoom.sf2"):
-        if os.path.exists(p):
-            return p
-    return None
 
 
 # ------------------------------------------------------------------------------------------
@@ -1300,26 +1334,33 @@ def build_bank(songs, src, verbose=True):
 # ------------------------------------------------------------------------------------------
 
 
-def convert_songs(g):
+def convert_songs(g, verbose=True):
     songs = {}
     for n in g.names(".MID"):
         s = convert_midi(g.read(n))
         songs[n] = (s, write_song(s))
+        if verbose and s.dropped:
+            print("EMIDI %s: dropped tracks (device %s): %s" % (
+                n, EMIDI_DEVICE_NAMES[EMIDI_DEVICE],
+                ", ".join("trk %d (%s, %d notes)" % (t, why, nn) for t, (why, nn) in sorted(s.dropped.items()))))
     return songs
 
 
-def make_source(verbose=True):
-    path = find_sf2()
-    if path and os.path.exists(path):
-        return SF2Source(path), path
+def make_source(sf2=None, verbose=True):
+    """Instrument sample source: the SoundFont given explicitly (`--sf2`), else built-in synthesis.
+    PS1: never guessed from host paths, so the disc image depends only on declared inputs."""
+    if sf2:
+        if not os.path.isfile(sf2):
+            raise SystemExit("error: SoundFont not found: %s" % sf2)
+        return SF2Source(sf2), sf2
     return SynthSource(), None
 
 
-def add_music(g, pack, verbose=True, songs=None):
+def add_music(g, pack, verbose=True, songs=None, sf2=None):
     """Add MUSBANK and one entry per .MID to `pack` (see module docstring); returns a stats dict."""
     t0 = time.time()
-    songs = songs or convert_songs(g)
-    src, path = make_source(verbose)
+    songs = songs or convert_songs(g, verbose)
+    src, path = make_source(sf2, verbose)
     bank, info = build_bank(songs, src, verbose)
     pack.add("MUSBANK", bank, info["nregions"])
     tot = 0
@@ -1332,7 +1373,8 @@ def add_music(g, pack, verbose=True, songs=None):
     if verbose:
         print("MUSBANK: %d bytes (header %d + ADPCM %d), %d regions (%d melodic, %d drum), %d samples; source: %s; %.1fs"
               % (len(bank), info["data_off"], info["data_size"], info["nregions"], info["nmel"],
-                 info["nregions"] - info["nmel"], len(info["jobs"]), path or "built-in synthesis", time.time() - t0))
+                 info["nregions"] - info["nmel"], len(info["jobs"]),
+                 ("SoundFont " + path) if path else "built-in synthesis (no --sf2)", time.time() - t0))
         print("songs: " + ", ".join("%s %d" % (n, b) for n, b in sizes.items()))
         print("songs total %d bytes in %d files (max %d)" % (tot, len(sizes), max(sizes.values())))
     return info
@@ -1436,6 +1478,12 @@ class _Pack:
 
 
 def main(argv):
+    argv = list(argv)
+    sf2 = None
+    if "--sf2" in argv:  # explicit instrument bank; default is the built-in synthesis
+        i = argv.index("--sf2")
+        sf2 = argv[i + 1]
+        del argv[i:i + 2]
     args = [a for a in argv[1:] if not a.startswith("--")]
     if not args:
         print(__doc__)
@@ -1443,7 +1491,7 @@ def main(argv):
     g = _load_grp(args[0])
     pack = _Pack()
     t0 = time.time()
-    info = add_music(g, pack)
+    info = add_music(g, pack, sf2=sf2)
     ok_bank = len(info["bank"]) <= 160 * 1024
     assert ok_bank, "bank too large"
     if "--selftest" in argv:

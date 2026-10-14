@@ -12,7 +12,6 @@
 #endif
 
 extern long dmval;
-extern unsigned long slowdiv_count, slowdiv_site[4];
 
 static inline long klabs(long a) { return a < 0 ? -a : a; }
 static inline long sqr(long a) { return a*a; }
@@ -48,6 +47,7 @@ static inline long div64_32(long long n, long d)
 	if (nh == 0) q = nl / dd;
 	else if (nh >= dd) q = 0x7fffffff;      /* overflow: saturate */
 	else q = divlu(nh, nl, dd);
+	if (q > 0x7fffffff) q = 0x7fffffff;     /* PS1: the quotient does not fit a signed long: saturate instead of flipping sign */
 	return neg ? -(long)q : (long)q;
 }
 
@@ -55,7 +55,6 @@ static inline long scale(long a, long b, long c)
 {
 	long long p = (long long)a*b;
 	if (p >= -2147483647LL && p <= 2147483647LL) return (long)p / c;
-	slowdiv_count++; slowdiv_site[0]++;
 	return div64_32(p, c);
 }
 
@@ -66,11 +65,10 @@ static inline long divscale(long a, long b, long c)
 {
 	long long n = (long long)a<<c;
 	if (n >= -2147483647LL && n <= 2147483647LL) return (long)n / b;
-	slowdiv_count++; slowdiv_site[1]++;
 	return div64_32(n, b);
 }
 
-/* scale() for screen-space projection: keeps 30 significant bits, relative error < 2^-13 */
+/* scale() for screen-space projection: keeps 30 significant bits; relative error < 2^-12 (|c>>s| >= 4096) */
 static inline long scale_approx(long a, long b, long c)
 {
 	long long p = (long long)a*b;
@@ -80,12 +78,13 @@ static inline long scale_approx(long a, long b, long c)
 		unsigned long long ap = (unsigned long long)(p < 0 ? -p : p);
 		s = 64 - __builtin_clzll(ap) - 30;
 	}
-	if (klabs(c >> s) < 4096) { slowdiv_count++; slowdiv_site[0]++; return div64_32(p, c); }
+	if (klabs(c >> s) < 4096) return div64_32(p, c);
 	return (long)(p >> s) / (c >> s);
 }
 
-/* Approximate divscale for ratios known to be small (|a/b| <= 2^10): pre-shifts
-   both operands so a single 32-bit division suffices; relative error < 2^-13. */
+/* Approximate divscale for ratios known to be small (|a/b| <= 2^10): pre-shifts both operands so a single
+   32-bit division suffices; keeps (30-c) numerator bits and >= 12 divisor bits, so the error is below
+   2^-12 relative to the divisor/numerator precision (about 2^-12 of 1.0 absolute when c >= 30). */
 static inline long divscale_approx(long a, long b, long c)
 {
 	long long n = (long long)a<<c;
@@ -93,7 +92,7 @@ static inline long divscale_approx(long a, long b, long c)
 	if (n >= -2147483647LL && n <= 2147483647LL) return (long)n / b;
 	s = 32 - __builtin_clz((unsigned long)klabs(a)) - (30 - c);
 	if (s < 0) s = 0;
-	if (klabs(b >> s) < 4096) { slowdiv_count++; slowdiv_site[2]++; return div64_32(n, b); }
+	if (klabs(b >> s) < 4096) return div64_32(n, b);
 	return ((a >> s) << c) / (b >> s);
 }
 
@@ -118,7 +117,7 @@ DIVSCALE(1) DIVSCALE(2) DIVSCALE(3) DIVSCALE(4) DIVSCALE(5) DIVSCALE(6) DIVSCALE
 DIVSCALE(9) DIVSCALE(10) DIVSCALE(11) DIVSCALE(12) DIVSCALE(13) DIVSCALE(14) DIVSCALE(15) DIVSCALE(16)
 DIVSCALE(17) DIVSCALE(18) DIVSCALE(19) DIVSCALE(20) DIVSCALE(21) DIVSCALE(22) DIVSCALE(23) DIVSCALE(24)
 DIVSCALE(25) DIVSCALE(26) DIVSCALE(27) DIVSCALE(28) DIVSCALE(29) DIVSCALE(30) DIVSCALE(31)
-static inline long divscale32(long a, long b) { slowdiv_count++; slowdiv_site[3]++; return div64_32((long long)a<<32, b); }
+static inline long divscale32(long a, long b) { return div64_32((long long)a<<32, b); }
 #undef MULSCALE
 #undef DMULSCALE
 #undef TMULSCALE

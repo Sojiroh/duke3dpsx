@@ -9,22 +9,34 @@ project(
 )
 
 set(DUKE_GRP "$ENV{HOME}/Downloads/DUKE3D/DUKE3D.GRP" CACHE FILEPATH "Path to DUKE3D.GRP (v1.3D)")
+# Music instrument bank source. Empty (default) = built-in synthesised bank. Set to a SoundFont (.sf2)
+# to build the bank from it; it is never searched for, and its samples end up in DUKE.DAT.
+set(DUKE_SF2 "" CACHE FILEPATH "Optional SoundFont (.sf2) for the music instrument bank (default: built-in synthesis)")
 set(DATA_DIR ${PROJECT_BINARY_DIR}/data)
+
+set(ASSET_ARGS ${DUKE_GRP} ${DATA_DIR})
+set(ASSET_DEPS
+	${PROJECT_SOURCE_DIR}/tools/mkdata.py ${PROJECT_SOURCE_DIR}/tools/grp.py
+	${PROJECT_SOURCE_DIR}/tools/spuadpcm.py ${PROJECT_SOURCE_DIR}/tools/mkmusic.py ${DUKE_GRP})
+if(DUKE_SF2)
+	list(APPEND ASSET_ARGS --sf2 ${DUKE_SF2})
+	list(APPEND ASSET_DEPS ${DUKE_SF2})
+endif()
 
 # Asset pack: DUKE.DAT + data_index.h generated from the GRP
 add_custom_command(
 	OUTPUT  ${DATA_DIR}/DUKE.DAT ${DATA_DIR}/data_index.h
-	COMMAND python3 ${PROJECT_SOURCE_DIR}/tools/mkdata.py ${DUKE_GRP} ${DATA_DIR}
-	DEPENDS ${PROJECT_SOURCE_DIR}/tools/mkdata.py ${PROJECT_SOURCE_DIR}/tools/grp.py ${DUKE_GRP}
+	COMMAND python3 ${PROJECT_SOURCE_DIR}/tools/mkdata.py ${ASSET_ARGS}
+	DEPENDS ${ASSET_DEPS}
 	COMMENT "Building DUKE.DAT asset pack"
 )
 add_custom_target(assets DEPENDS ${DATA_DIR}/DUKE.DAT ${DATA_DIR}/data_index.h)
 
 option(DUKE_VIEWER "Build the engine map viewer instead of the game" OFF)
 
-file(GLOB PS1_SRC    ${PROJECT_SOURCE_DIR}/src/ps1/*.c)
-file(GLOB ENGINE_SRC ${PROJECT_SOURCE_DIR}/src/engine/*.c)
-file(GLOB GAME_SRC   ${PROJECT_SOURCE_DIR}/src/game/*.c)
+file(GLOB PS1_SRC    CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/src/ps1/*.c)
+file(GLOB ENGINE_SRC CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/src/engine/*.c)
+file(GLOB GAME_SRC   CONFIGURE_DEPENDS ${PROJECT_SOURCE_DIR}/src/game/*.c)
 if(DUKE_VIEWER)
 	list(FILTER PS1_SRC EXCLUDE REGEX "/main\\.c$")
 	set(GAME_SRC ${PROJECT_SOURCE_DIR}/tools/viewer/viewer_main.c)

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Build DUKE.DAT (sector-aligned asset pack for the PS1 port) from DUKE3D.GRP.
 
-Usage: mkdata.py <DUKE3D.GRP> <out dir>
-Writes <out>/DUKE.DAT and <out>/data_index.h.
+Usage: mkdata.py <DUKE3D.GRP> <out dir> [--sf2 FILE.sf2]
+Writes <out>/DUKE.DAT and <out>/data_index.h.  Music instruments come from the SoundFont given with
+--sf2 (explicit, never searched for); without it the built-in synthesised bank is used.
 
 Pack layout (little-endian, every entry starts on a 2048-byte sector):
   sector 0..: directory  = "DK3DPAK1", u32 count, count * ENTRY (32 bytes:
@@ -302,12 +303,16 @@ def add_sounds(g, pack):
         if len(pcm) == 0:
             pcm = np.zeros(28, dtype=np.int32)
         pcm = pcm.copy()
-        if name not in looped:
+        if name in looped:
+            # PS1: pad to a whole ADPCM block by stretching the cycle, not with zeros (a zero gap
+            # would click on every loop; spu_fx.c loops block 0 .. last audio block)
+            pcm = spuadpcm.pad_loop(pcm)
+        else:
             # short fade-out so the terminator block (silence) does not click
             n = min(len(pcm) // 4, max(8, int(rate * 0.006)))
             if n > 0:
                 pcm[-n:] = (pcm[-n:] * np.linspace(1.0, 0.0, n)).astype(np.int32)
-        blob = spuadpcm.encode(pcm)
+        blob = spuadpcm.encode(pcm, restart=name in looped)
         dec = spuadpcm.decode(blob)
         n = len(pcm)
         err = spuadpcm.rms_error(pcm, dec)
@@ -328,14 +333,20 @@ def add_sounds(g, pack):
              biggest[1], biggest[0] // 1024, len(looped)))
 
 
-def add_music(g, pack):
+def add_music(g, pack, sf2=None):
     import mkmusic  # tools/mkmusic.py: MUSBANK + per-song event streams
 
-    mkmusic.add_music(g, pack)
+    mkmusic.add_music(g, pack, sf2=sf2)
 
 
 def main():
-    grp_path, outdir = sys.argv[1], sys.argv[2]
+    argv = sys.argv[1:]
+    sf2 = None
+    if "--sf2" in argv:  # PS1: explicit SoundFont for the music bank; never auto-detected
+        i = argv.index("--sf2")
+        sf2 = argv[i + 1] or None
+        del argv[i:i + 2]
+    grp_path, outdir = argv[0], argv[1]
     os.makedirs(outdir, exist_ok=True)
     g = G.Grp(grp_path)
     pack = Pack()
@@ -357,7 +368,7 @@ def main():
         pack.add(name, g.read(name))
     for name in g.names(".ANM"):
         pack.add(name, g.read(name))
-    add_music(g, pack)
+    add_music(g, pack, sf2)
     add_sounds(g, pack)
     pack.add("DUKE3D.BIN", g.read("DUKE3D.BIN"))
 

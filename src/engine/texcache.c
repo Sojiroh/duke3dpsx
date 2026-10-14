@@ -110,7 +110,30 @@ static u32 texframe = 1;
 static u32 vram_used;             /* resident block texels */
 #define VRAM_TEXELS (704 * 512 * 2)
 #define VRAM_PRESSURE (VRAM_TEXELS * 6 / 10)
-int tex_stat_resident, tex_stat_misses, tex_stat_loads;
+#define PRESSURE_WINDOW 120       /* frames: only slots used this recently (or locked) count as VRAM pressure */
+int tex_stat_resident, tex_stat_misses, tex_stat_loads, tex_stat_half;
+#ifdef PS1_PROF
+int tex_stat_halfloads, tex_stat_oldhalf;   /* cumulative loads: chosen half-res / would have been half-res under the old "vram_used > 60%" rule */
+#endif
+
+/* PS1: half-resolution copies are chosen when the *working set* is large, not when VRAM merely holds stale
+   tiles (LRU eviction frees those on demand). active_texels = block texels of locked slots and of slots
+   touched in the last PRESSURE_WINDOW frames; recomputed once per frame, then kept current by
+   begin_load/evict_slot. */
+static u32 active_texels, active_frame;
+static inline u32 node_texels(int n) { return (1u << nodes[n].lw) * (1u << nodes[n].lh); }
+static inline int slot_active(const Slot *sl) { return sl->lock || sl->lastuse + PRESSURE_WINDOW >= texframe; }
+static u32 active_texels_now(void)
+{
+	if (active_frame != texframe) {
+		u32 t = 0;
+		int s;
+		for (s = 0; s < MAXSLOTS; s++)
+			if (slots[s].state && slots[s].node >= 0 && slot_active(&slots[s])) t += node_texels(slots[s].node);
+		active_texels = t; active_frame = texframe;
+	}
+	return active_texels;
+}
 
 /* ---- piece table (only multi-piece tiles) ------------------------------ */
 typedef struct { u16 tile, xoff, yoff, w, h, pad; u32 sector; } PieceRec;
@@ -132,7 +155,7 @@ static int piece_info(int picnum, int piece, int *xoff, int *yoff, int *w, int *
 {
 	if (tilenpieces[picnum] <= 1) {
 		*xoff = *yoff = 0; *w = tilesizx[picnum]; *h = tilesizy[picnum]; *sector = tilesect[picnum];
-		if ((tileflags[picnum] & 1) && vram_used > VRAM_PRESSURE) {
+		if ((tileflags[picnum] & 1) && active_texels_now() > VRAM_PRESSURE) {
 			*w >>= 1; *h >>= 1; *sector = tileaux[picnum];
 			return 1;
 		}
@@ -164,7 +187,8 @@ void tex_init(void)
 	if (!tiledata) fatal("TILEDATA missing");
 	const PakEntry *e = pak_find("PIECES");
 	if (e && DAT_NUMPIECES > 0) pak_read_bytes(e, 0, piecetab, sizeof(PieceRec) * DAT_NUMPIECES);
-	tex_stat_resident = 0;
+	tex_stat_resident = tex_stat_half = 0;
+	active_texels = 0; active_frame = 0;
 }
 
 static int find_slot(int picnum, int piece)
@@ -179,8 +203,14 @@ static int find_slot(int picnum, int piece)
 static void evict_slot(int s)
 {
 	Slot *sl = &slots[s];
-	if (sl->node >= 0) { vram_used -= (1 << nodes[sl->node].lw) * (1 << nodes[sl->node].lh); node_free(sl->node); }
+	if (sl->node >= 0) {
+		u32 n = node_texels(sl->node);
+		vram_used -= n;
+		if (active_frame == texframe && slot_active(sl)) active_texels = active_texels > n ? active_texels - n : 0;
+		node_free(sl->node);
+	}
 	if (sl->piece == 0) tile2slot[sl->picnum] = 0xffff;
+	if (sl->half) tex_stat_half--;
 	sl->state = 0; sl->node = -1;
 	tex_stat_resident--;
 }
@@ -228,6 +258,10 @@ static int begin_load(int picnum, int piece, int *stride, int *h, u32 *sector)
 	u32 sec;
 	half = piece_info(picnum, piece, &xoff, &yoff, &w, &hh, &sec);
 	if (w <= 0 || hh <= 0) return -1;
+	active_texels_now();   /* current before slots change (alloc_slot may evict) */
+#ifdef PS1_PROF
+	if (tilenpieces[picnum] <= 1 && (tileflags[picnum] & 1)) { if (half) tex_stat_halfloads++; if (vram_used > VRAM_PRESSURE) tex_stat_oldhalf++; }
+#endif
 	s = alloc_slot();
 	if (s < 0) return -1;
 	s16 n = alloc_block(w, hh);
@@ -236,10 +270,11 @@ static int begin_load(int picnum, int piece, int *stride, int *h, u32 *sector)
 	nodes[n].state = 2; nodes[n].slot = s;
 	sl->picnum = picnum; sl->piece = piece; sl->node = n; sl->state = 1; sl->lock = 0; sl->half = half;
 	sl->w = w; sl->h = hh; sl->xoff = xoff; sl->yoff = yoff; sl->lastuse = texframe;
-	vram_used += (1 << nodes[n].lw) * (1 << nodes[n].lh);
+	{ u32 blk = node_texels(n); vram_used += blk; active_texels += blk; }
 	if (piece == 0) tile2slot[picnum] = s;
 	*stride = piece_stride(w); *h = piece_rows(hh); *sector = sec;
 	tex_stat_resident++;
+	if (half) tex_stat_half++;
 	return s;
 }
 
@@ -258,12 +293,38 @@ static void finish_load_from(int s, int stride, int h, const void *src)
 
 static void finish_load(int s, int stride, int h) { finish_load_from(s, stride, h, staging); }
 
+static void queue_tile(int picnum)
+{
+	int next = (qtail + 1) & (QLEN - 1);
+	if ((pendingbit[picnum >> 3] & (1 << (picnum & 7))) || next == qhead) return;
+	queue[qtail] = picnum; qtail = next;
+	pendingbit[picnum >> 3] |= 1 << (picnum & 7);
+}
+
+/* cd_done: 0 = read pending, 1 = staged data valid, -1 = CD error (the staging buffer is not valid) */
+static void cd_cb(int ok) { cd_done = ok ? 1 : -1; }
+
+/* Complete the in-flight async load once its read has finished; returns 1 when nothing is in flight. */
+static int inflight_finish(void)
+{
+	if (inflight_slot < 0) return 1;
+	if (!cd_done) return 0;
+	if (cd_done > 0) finish_load(inflight_slot, inflight_stride, inflight_h);
+	else {   /* PS1: failed read: never mark the tile valid; free the slot and request the tile again */
+		int pic = slots[inflight_slot].picnum;
+		evict_slot(inflight_slot);
+		queue_tile(pic);
+	}
+	inflight_slot = -1; cd_done = 0;
+	return 1;
+}
+
 /* Preload (and optionally lock) the single-piece tiles first..last. Consecutive tiles that are adjacent
    on the disc are fetched with one read (fonts: ~100 tiny tiles, otherwise one CD seek each). */
 void tex_preload_range(int first, int last, int lock)
 {
 	int t = first;
-	while (inflight_slot >= 0) { if (cd_done) { finish_load(inflight_slot, inflight_stride, inflight_h); inflight_slot = -1; cd_done = 0; } }
+	while (!inflight_finish()) ;
 	while (t <= last) {
 		struct { u16 pic; u16 stride, h; u16 off; s16 slot; } run[64];
 		int n = 0, i;
@@ -312,16 +373,10 @@ void tex_preload(int picnum)
 	}
 }
 
-static void cd_cb(void) { cd_done = 1; }
 
 static void pump(void)
 {
-	if (inflight_slot >= 0) {
-		if (!cd_done) return;
-		finish_load(inflight_slot, inflight_stride, inflight_h);
-		inflight_slot = -1;
-		cd_done = 0;
-	}
+	if (!inflight_finish()) return;
 	if (pak_busy()) return;   /* a music block read is in flight or the previous read's pause has not completed: retry next frame */
 	while (qhead != qtail) {
 		int picnum = queue[qhead];
@@ -374,13 +429,7 @@ int tex_lookup(int picnum, int piece, TexRef *out)
 		return 1;
 	}
 	tex_stat_misses++;
-	if (s < 0 && !(pendingbit[picnum >> 3] & (1 << (picnum & 7)))) {
-		int next = (qtail + 1) & (QLEN - 1);
-		if (next != qhead) {
-			queue[qtail] = picnum; qtail = next;
-			pendingbit[picnum >> 3] |= 1 << (picnum & 7);
-		}
-	}
+	if (s < 0) queue_tile(picnum);
 	return 0;
 }
 
@@ -390,7 +439,7 @@ int tex_lookup_sync(int picnum, int piece, TexRef *out)
 {
 	if (tex_lookup(picnum, piece, out)) return 1;
 	/* finish any in-flight async load first so the staging buffer is free */
-	while (inflight_slot >= 0) { if (cd_done) { finish_load(inflight_slot, inflight_stride, inflight_h); inflight_slot = -1; cd_done = 0; } }
+	while (!inflight_finish()) ;
 	tex_preload(picnum);
 	return tex_lookup(picnum, piece, out);
 }
@@ -399,6 +448,8 @@ int tex_vram_used(void) { return vram_used; }
 u32 tex_sector(int picnum) { return tilenpieces[picnum] > 1 ? piecetab[tileaux[picnum]].sector : tilesect[picnum]; }
 /* Percentage of the cache VRAM that is allocated. */
 int tex_vram_pct(void) { return (int)(vram_used * 100 / VRAM_TEXELS); }
+/* Percentage of the cache VRAM that is in the recent working set (drives the half-res decision). */
+int tex_active_pct(void) { return (int)(active_texels_now() * 100 / VRAM_TEXELS); }
 
 /* Must be called once per frame while the GPU is idle (video_wait_gpu() first). */
 void tex_frame(void)
@@ -410,7 +461,7 @@ void tex_frame(void)
 void tex_flush(void)
 {
 	int s;
-	while (inflight_slot >= 0) { if (cd_done) { finish_load(inflight_slot, inflight_stride, inflight_h); inflight_slot = -1; } }
+	while (!inflight_finish()) ;
 	for (s = 0; s < MAXSLOTS; s++) if (slots[s].state) evict_slot(s);
 	qhead = qtail = 0;
 	memset(pendingbit, 0, sizeof(pendingbit));

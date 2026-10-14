@@ -315,7 +315,7 @@ void doanimations(void)
                 {
                     myz += v;
                     myzvel = 0;
-                    myzbak[((movefifoplc-1)&(MOVEFIFOSIZ-1))] = ps[p].posz;
+                    /* PS1: myzbak[] (multiplayer prediction backup) removed */
                 }
             }
 

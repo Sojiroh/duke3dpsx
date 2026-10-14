@@ -286,7 +286,11 @@ static const void *bl_rec(int kind, long idx, void *tmp)
         default:      if(idx >= bl_nspr) return 0; sz = 44; off = 26+40*bl_ns+32*bl_nw+44*idx; break;
     }
     klseek(bl_h,off,0);
-    if(kread(bl_h,tmp,sz) != sz) return 0;
+    if(kread(bl_h,tmp,sz) != sz)
+    {
+        S.err = 1;      /* PS1: an unreadable baseline record would silently be coded/decoded as zeros */
+        return 0;
+    }
     return tmp;
 }
 
@@ -825,22 +829,33 @@ int sg_read(int spot)
 
     /* pass 2: decode */
     if(open_meta(spot,cur_alt1[spot]-1,&m) < 0) return -1;
+    /* PS1: ud.volume/level/skill and the slot name are committed only after a successful decode */
+    /* the player list (connecthead/connectpoint2) is part of the decoded stream; a failed decode leaves
+       garbage there (e.g. connectpoint2[0] = 0 loops enterlevel forever), so keep the live values */
+    {
+        short keep_head = connecthead, keep_p2[MAXPLAYERS];
+        memcpy(keep_p2,connectpoint2,sizeof(keep_p2));
+        bl_open(m.info.vol,m.info.lvl,m.flags&1);
+        codec_reset(M_READ);
+        S.inleft = m.len;
+        xfer_state();       /* decodes straight into the live game arrays */
+        bl_close();
+        mc_read_close();
+        if(S.err || S.inleft != 0 || S.ip != S.il || S.dzero || S.dlit)
+        {
+            connecthead = keep_head;
+            memcpy(connectpoint2,keep_p2,sizeof(keep_p2));
+            /* the world / players were already overwritten: tell the caller (SG_DESTROYED), which must not
+               continue with this half-restored state (loadplayer re-enters the current level) */
+            sg_error = "SAVE FILE CORRUPT";
+            return SG_DESTROYED;
+        }
+    }
     memcpy(ud.savegame[spot],m.info.name,19);
     ud.savegame[spot][19] = 0;
     ud.volume_number = m.info.vol;
     ud.level_number = m.info.lvl;
     ud.player_skill = m.info.skill;
-    bl_open(m.info.vol,m.info.lvl,m.flags&1);
-    codec_reset(M_READ);
-    S.inleft = m.len;
-    xfer_state();
-    bl_close();
-    mc_read_close();
-    if(S.err || S.inleft != 0 || S.ip != S.il || S.dzero || S.dlit)
-    {
-        sg_error = "SAVE FILE CORRUPT";
-        return -1;
-    }
 #ifdef PS1_SAVETEST
     dbg("LOAD slot %d: payload %lu bytes ok\n",spot,m.len);
 #endif

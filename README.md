@@ -43,6 +43,7 @@ Environment variables read by `build.sh`:
 | `DUKE_GRP` | `$HOME/Downloads/DUKE3D/DUKE3D.GRP` | Path to `DUKE3D.GRP` (v1.3D) |
 | `BUILD_DIR` | `build` | Build directory, relative to the project root |
 | `DUKE_VIEWER` | `OFF` | `ON` builds the engine map viewer (`tools/viewer/viewer_main.c`) instead of the game |
+| `DUKE_SF2` | empty | Optional SoundFont (`.sf2`) for the music instruments. Empty uses the built-in synthesised bank. It is never searched for; the file is passed to `tools/mkdata.py --sf2` and its samples are stored in `DUKE.DAT`, so check its licence before distributing the disc image |
 | `EXTRA_CFLAGS` | empty | Extra compiler flags, e.g. debug switches |
 
 Debug switches (set through `EXTRA_CFLAGS`):
@@ -50,11 +51,16 @@ Debug switches (set through `EXTRA_CFLAGS`):
 - `-DPS1_NOAUDIO=1`: disables all sound and music.
 - `-DPS1_WARP=N`: skips the logo, title and menu and starts episode *E*, level *L* with
   `N = E*10 + L` (for example `-DPS1_WARP=11` starts E1L1 at skill 2).
-- Other debug-only switches: `-DPS1_PROF` (per-frame timing every 120 frames), `-DPS1_HOLES`
+- Other debug-only switches: `-DPS1_PROF` (per-frame timing, engine section timers and texture-cache /
+  primitive-buffer statistics every 120 frames; the engine timers exist only under this flag),
+  `-DPRIM_RESERVE=<bytes>` (test the 2D primitive reserve), `-DPS1_HOLES`
   (clears the 3D view to white to expose uncovered pixels), `-DPS1_WARPX/Y/ANG/SECT` (start
   position override, god mode), `-DPS1_SAVETEST=<seconds>` (memory card round-trip test).
 
-Flags are cached per build directory by CMake. Use a separate `BUILD_DIR` for each flag set:
+Flags and options are cached per build directory by CMake: `build.sh` passes `DUKE_GRP`,
+`DUKE_SF2`, `DUKE_VIEWER` and `EXTRA_CFLAGS` only when the variable is set, so running
+`./build.sh` again in a configured directory keeps them (`EXTRA_CFLAGS=""` clears the flags).
+Use a separate `BUILD_DIR` for each flag set:
 
 ```sh
 BUILD_DIR=build-noaudio EXTRA_CFLAGS="-DPS1_NOAUDIO=1" ./build.sh iso
@@ -89,7 +95,7 @@ In game:
 | Right stick | X: turn, Y: look up/down (analog; mouse-style aiming is always on) |
 | R1 | Fire |
 | L1 | Jump |
-| R2 | Run (auto-run is on by default) |
+| R2 | Toggle auto-run (the game prints `RUN MODE ON` / `RUN MODE OFF`; the default is run) |
 | L2 | Crouch |
 | CROSS | Open / Use |
 | CIRCLE | Jump (alternative) |
@@ -112,6 +118,8 @@ SELECT combinations:
 | SELECT + L1 | Shrink screen |
 | SELECT + R1 | Enlarge screen |
 | SELECT + START | Pause |
+| SELECT + L2 | Aim up (held: keeps aiming, no auto-centre) |
+| SELECT + R2 | Aim down (held: keeps aiming, no auto-centre) |
 
 Menus and screens:
 
@@ -162,7 +170,9 @@ Options:
 - `--out DIR`: output directory for screenshots (default `$BUILD_DIR/shots`).
 - `--timeout S`: seconds before the run is aborted (default 300).
 - `--memcard FILE`: memory card image for slot 1.
-- `--watchdog N`: quit after N stall samples (default 12; level loads and saves need 100+).
+- `--watchdog N`: quit after N stall samples (default 60). The first sample comes after 240 vsyncs
+  without a new game frame, then one every 40 vsyncs; the count restarts whenever the game
+  advances a frame.
 - `--dynarec`: enable the dynamic recompiler in PCSX-Redux.
 
 Actions:
@@ -174,15 +184,18 @@ Actions:
 | `hold BTN[+BTN]` | Press and keep held |
 | `release BTN[+BTN]` | Release |
 | `shot NAME` | Save a screenshot as `NAME.png` in the output directory |
-| `vram NAME` | Dump VRAM as `NAME.png` |
-| `pc N` | Print the program counter after N vsyncs |
+| `vram NAME` | Dump the whole VRAM as raw 16-bit pixels to `NAME.vram` in the output directory (no PNG) |
+| `pc N` | Print the CPU state (`EXCEPTION ... (sample)` lines) every vsync for N vsyncs |
 | `prof N` | Sample the PC over N vsyncs and print a PROFILE |
 | `quit` | Exit the emulator |
 
 Buttons: CROSS, CIRCLE, SQUARE, TRIANGLE, UP, DOWN, LEFT, RIGHT, L1, L2, R1, R2, START, SELECT.
 
 The game's TTY output is printed. A crash prints `EXCEPTION pc=... (symbol)`. A stalled
-frame counter prints `WATCHDOG`. The harness exits with code 0 when the script completes.
+frame counter prints `WATCHDOG`. Symbols and the watchdog address come from the `.elf` next to
+`--exe` (or `$BUILD_DIR/duke3d.elf` with `--iso`). The harness exits with code 0 when the script
+completes or after `quit`, 3 after a CPU exception (`crash.png`), 4 after the watchdog fired
+(`hang.png`) and 124 on `--timeout`.
 
 Boot to the 3D Realms screen takes about 1520 vsyncs in the emulator. The first CROSS skips
 that screen, the second skips the title animation and shows the main menu (sequence above).
@@ -192,12 +205,20 @@ Loading E1L1 takes about 2000 vsyncs.
 
 - **Renderer**: walls, floors and sprites are drawn as textured GPU quads. Build's column
   rasteriser is not used. `rotatesprite` and the palette tint overlay are also GPU operations.
+  The 3D emitters stop 6 KB before the end of the primitive buffer so that the weapon, HUD, menus
+  and the tint always fit; dropped 3D quads are counted (`PROF tex:` line under `-DPS1_PROF`).
+  Non-power-of-2 tiles that repeat are split exactly at the texture period, so they tile seamlessly.
 - **Textures**: a VRAM tile cache streams texture pages from `DUKE.DAT` on the CD. Half-resolution
-  copies are used when VRAM is under pressure.
+  copies are used only when the recent working set (tiles used in the last 120 frames, plus locked
+  tiles) fills more than 60% of the cache, not merely because stale tiles still occupy VRAM.
 - **Sound effects**: VOC files are converted to SPU-ADPCM at build time and played through
   the audiolib FX API on the SPU.
 - **Music**: a MIDI-style sequencer driven by the Timer 2 interrupt. Song blocks are streamed
-  from the CD with asynchronous reads.
+  from the CD with asynchronous reads. Instruments are an SPU-ADPCM sample bank built by
+  `tools/mkmusic.py`: synthesised by default, or taken from a SoundFont passed with `--sf2`
+  (`DUKE_SF2`). Looping sounds are padded to a whole ADPCM block by stretching the loop by fewer
+  than 28 samples (no zero gap), and their first block is encoded so it does not depend on the
+  samples before it, so the loop point does not click.
 - **CD access**: all CD commands are issued from the main thread, while the drive is idle
   (`pak.c`: no asynchronous read in flight and the `CdlPause` that ends a read completed). The
   only command sent from interrupt context is that `CdlPause`, by the SDK's sector callback; the
@@ -226,8 +247,9 @@ Loading E1L1 takes about 2000 vsyncs.
   many seconds in game, perturbs the state, saves again (safe replace), perturbs again, loads and
   prints state checksums (`SAVETEST ...` lines); `-DPS1_SAVETEST_LOADONLY=1` only loads slot 0;
   `-DPS1_SAVETEST_KEEPOLD=1` skips erasing the old copy (simulates an interrupted save).
-- **Memory**: the console has 2 MB of RAM and no heap is used. `build.sh` enforces that the
-  end of `.bss` (`_end`) stays at or below 0x801F8000, keeping 32 KB for the stack (it prints
+- **Memory**: the console has 2 MB of RAM. The SDK heap (`InitHeap` at `_end`, a few KB used by
+  `CdSearchFile`) and the stack share the space above `.bss`. `build.sh` enforces that the end of
+  `.bss` (`_end`) stays at or below 0x801F8000, keeping 32 KB for them (it prints
   `RAM: _end=..., stack reserve N KB`; the current build leaves about 56 KB).
 - **Performance**: the 3D view runs Build's column visibility at half horizontal resolution
   (160 columns, `REND_XSHIFT` in `render.c`) and emits merged multi-column quads; E1L1 runs at
@@ -249,5 +271,9 @@ Known limitations:
 - Wall textures fall back to half-resolution copies under VRAM pressure (blocky up close).
 - Boot to the logo takes ~35 s and a level load ~35 s at 2x CD speed; saving takes several
   seconds (BIOS card routines; music pauses meanwhile).
-- Music is played by an SPU sequencer with synthesized instruments, not a General MIDI wavetable.
+- Music is played by an SPU sequencer, not a General MIDI wavetable. The instrument samples come from
+  the built-in synthesised bank unless a SoundFont is given explicitly (`DUKE_SF2`, see Building; the
+  SoundFont's samples are then stored in `DUKE.DAT`). Following audiolib's EMIDI handling for a General
+  MIDI device, tracks designated for other sound cards (CC110/CC111 track designation) are not played;
+  `mkmusic.py` lists the dropped tracks per song when `DUKE.DAT` is built.
 - The 3D column engine runs at 160 columns (`REND_XSHIFT=1`) for speed.
