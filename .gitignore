@@ -7,3 +7,4 @@ upstream/
 shots/
 __pycache__/
 *.mcd
+*.kate-swp
