@@ -8,7 +8,18 @@ project(
 	DESCRIPTION  "Duke Nukem 3D for the PlayStation"
 )
 
-set(DUKE_GRP "$ENV{HOME}/Downloads/DUKE3D/DUKE3D.GRP" CACHE FILEPATH "Path to DUKE3D.GRP (v1.3D)")
+# Default GRP location: $HOME on Linux/macOS, %USERPROFILE% on Windows (HOME is normally unset there).
+if(DEFINED ENV{HOME} AND NOT "$ENV{HOME}" STREQUAL "")
+	set(_duke_home "$ENV{HOME}")
+else()
+	set(_duke_home "$ENV{USERPROFILE}")
+endif()
+file(TO_CMAKE_PATH "${_duke_home}" _duke_home)
+set(DUKE_GRP "${_duke_home}/Downloads/DUKE3D/DUKE3D.GRP" CACHE FILEPATH "Path to DUKE3D.GRP (v1.3D)")
+# The asset pack is built by tools/mkdata.py (needs numpy + Pillow). Pass -DPython3_EXECUTABLE=<python> to
+# pick a specific interpreter (build.sh / build.ps1: DUKE_PYTHON / -Python); `python3` does not exist on a
+# python.org Windows install, so it is located with FindPython3 instead of being hard-coded.
+find_package(Python3 3.8 COMPONENTS Interpreter REQUIRED)
 # Music instrument bank source. Empty (default) = built-in synthesised bank. Set to a SoundFont (.sf2)
 # to build the bank from it; it is never searched for, and its samples end up in DUKE.DAT.
 set(DUKE_SF2 "" CACHE FILEPATH "Optional SoundFont (.sf2) for the music instrument bank (default: built-in synthesis)")
@@ -26,7 +37,7 @@ endif()
 # Asset pack: DUKE.DAT + data_index.h generated from the GRP
 add_custom_command(
 	OUTPUT  ${DATA_DIR}/DUKE.DAT ${DATA_DIR}/data_index.h
-	COMMAND python3 ${PROJECT_SOURCE_DIR}/tools/mkdata.py ${ASSET_ARGS}
+	COMMAND ${Python3_EXECUTABLE} ${PROJECT_SOURCE_DIR}/tools/mkdata.py ${ASSET_ARGS}
 	DEPENDS ${ASSET_DEPS}
 	COMMENT "Building DUKE.DAT asset pack"
 )
@@ -90,3 +101,18 @@ psn00bsdk_add_cd_image(
 	${PROJECT_SOURCE_DIR}/iso.xml
 	DEPENDS duke3d ${PROJECT_SOURCE_DIR}/system.cnf ${DATA_DIR}/DUKE.DAT
 )
+
+# RAM budget check (always runs; the iso target depends on it). The stack grows down from 0x801FFFF0; keep
+# 32 KB between the end of .bss (_end) and the stack top. That reserve also holds the SDK heap (InitHeap at
+# _end, a few KB used by CdSearchFile) and the stack. tools/ramcheck.cmake reads _end with the toolchain's nm,
+# prints "RAM: _end=0x..., stack reserve N KB" and fails the build when _end > 0x801F8000.
+# CMAKE_C_COMPILER is <toolchain>/bin/mipsel-none-elf-gcc[.exe]; nm sits next to it.
+string(REGEX REPLACE "-gcc(\\.[eE][xX][eE])?$" "-nm\\1" DUKE_NM "${CMAKE_C_COMPILER}")
+add_custom_target(
+	ramcheck
+	COMMAND ${CMAKE_COMMAND} -DNM=${DUKE_NM} -DELF=$<TARGET_FILE:duke3d> -P ${PROJECT_SOURCE_DIR}/tools/ramcheck.cmake
+	DEPENDS duke3d
+	COMMENT "Checking the RAM budget"
+	VERBATIM
+)
+add_dependencies(iso ramcheck)

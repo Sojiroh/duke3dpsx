@@ -10,19 +10,47 @@ release published by 3D Realms.
 
 ## Requirements
 
+Both platforms need **CMake** (3.21 or newer), **Python 3** (3.8 or newer) with `numpy` and
+`Pillow` (used by the build tools and `tools/emu.py`), the PSn00bSDK with its MIPS toolchain,
+and optionally **PCSX-Redux** for testing. The platform-specific downloads:
+
+### Linux
+
 - **MIPS toolchain**: `gcc-mipsel-none-elf-12.3.0-linux.zip` unpacked into `tools/gcc`
-  (so that `tools/gcc/bin/mipsel-none-elf-gcc` exists).
+  (so that `tools/gcc/bin/mipsel-none-elf-gcc` exists). The SDK zip below also bundles the same
+  toolchain, so `tools/gcc` is optional; this layout is the documented one.
 - **PSn00bSDK v0.24**: `PSn00bSDK-0.24-Linux.zip` from
   <https://github.com/Lameguy64/PSn00bSDK/releases>, unpacked into `tools/sdk`
   (so that `tools/sdk/PSn00bSDK-0.24-Linux/` exists).
-- **CMake** (3.21 or newer).
-- **Python 3** with `numpy` and `Pillow` (used by the build tools and `tools/emu.py`).
 - **PCSX-Redux** (optional, for testing): place the AppImage at
   `tools/redux/PCSX-Redux-HEAD-x86_64.AppImage`.
 
-`tools/gcc`, `tools/sdk`, `tools/redux`, `build*/` and `upstream/` are git-ignored.
+### Windows
+
+- **PSn00bSDK v0.24**: `PSn00bSDK-0.24-win32.zip` from
+  <https://github.com/Lameguy64/PSn00bSDK/releases>, unpacked into `tools/sdk` so that
+  `tools/sdk/PSn00bSDK-0.24-win32/bin/mipsel-none-elf-gcc.exe` exists. The zip bundles the GCC
+  12.3.0 MIPS toolchain, `ninja`, `mkpsxiso` and `elf2x`; nothing else is needed for the
+  compiler. `gcc-mipsel-none-elf-12.3.0-windows.zip` unpacked into `tools/gcc` is optional and,
+  if `tools/gcc/bin/mipsel-none-elf-gcc.exe` exists, is used instead of the bundled copy.
+- **CMake** (3.21 or newer), for example `winget install Kitware.CMake`.
+- **Python 3**, for example `winget install Python.Python.3.12`, then
+  `pip install numpy pillow`.
+- **Windows PowerShell 5.1** (built into Windows 10/11) or PowerShell 7.
+- **PCSX-Redux** (optional, for testing): the Windows x64 build from
+  <https://distrib.app/pub/org/pcsx-redux/project/dev-win-x64> unpacked into `tools/redux/` so
+  that `tools/redux/pcsx-redux.exe` exists.
+
+The Windows build uses the same CMake project as Linux (with the Ninja generator). It has not been
+run on a Windows machine: it was validated on Linux, running `build.ps1` under PowerShell, and
+nothing has been executed on Windows itself. Windows-specific problems are possible.
+WSL2 is an alternative: inside WSL2 follow the Linux instructions unchanged.
+
+`tools/gcc`, `tools/sdk`, `tools/redux`, `build*/` and `upstream/` are git-ignored on both platforms.
 
 ## Building
+
+### Building on Linux
 
 ```sh
 DUKE_GRP=/path/to/DUKE3D.GRP ./build.sh iso
@@ -35,16 +63,21 @@ This configures CMake, runs `tools/mkdata.py` to produce `build/data/DUKE.DAT` a
 - `build/duke3d.exe` and `build/duke3d.elf`
 
 `./build.sh` alone builds only the executable. `./build.sh clean` removes the build directory.
+Both scripts build the `ramcheck` target, which prints the RAM budget line (see Technical notes)
+and fails the build when it is exceeded; `iso` depends on it.
 
-Environment variables read by `build.sh`:
+Environment variables read by `build.sh` (and by `build.ps1`, see below):
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `DUKE_GRP` | `$HOME/Downloads/DUKE3D/DUKE3D.GRP` | Path to `DUKE3D.GRP` (v1.3D) |
+| `DUKE_GRP` | `$HOME/Downloads/DUKE3D/DUKE3D.GRP` (`%USERPROFILE%\Downloads\DUKE3D\DUKE3D.GRP` when `HOME` is not set) | Path to `DUKE3D.GRP` (v1.3D) |
 | `BUILD_DIR` | `build` | Build directory, relative to the project root |
 | `DUKE_VIEWER` | `OFF` | `ON` builds the engine map viewer (`tools/viewer/viewer_main.c`) instead of the game |
 | `DUKE_SF2` | empty | Optional SoundFont (`.sf2`) for the music instruments. Empty uses the built-in synthesised bank. It is never searched for; the file is passed to `tools/mkdata.py --sf2` and its samples are stored in `DUKE.DAT`, so check its licence before distributing the disc image |
 | `EXTRA_CFLAGS` | empty | Extra compiler flags, e.g. debug switches |
+| `DUKE_PYTHON` | found by CMake | Python interpreter for the asset step (passed as `-DPython3_EXECUTABLE=`); needs `numpy` and `Pillow` |
+| `DUKE_GAME_OPT` | `-Os` (CMake default) | Optimisation flag for `src/game/*.c`; empty restores the SDK's `-O2` |
+| `DUKE_GAME_KEEP` | `actors` | Semicolon-separated `src/game` sources (base names) kept at `-O2` (`ps1_control` and `ps1_platform` always are) |
 
 Debug switches (set through `EXTRA_CFLAGS`):
 
@@ -58,13 +91,74 @@ Debug switches (set through `EXTRA_CFLAGS`):
   position override, god mode), `-DPS1_SAVETEST=<seconds>` (memory card round-trip test).
 
 Flags and options are cached per build directory by CMake: `build.sh` passes `DUKE_GRP`,
-`DUKE_SF2`, `DUKE_VIEWER` and `EXTRA_CFLAGS` only when the variable is set, so running
+`DUKE_SF2`, `DUKE_VIEWER`, `EXTRA_CFLAGS` and `DUKE_PYTHON` only when the variable is set, so running
 `./build.sh` again in a configured directory keeps them (`EXTRA_CFLAGS=""` clears the flags).
 Use a separate `BUILD_DIR` for each flag set:
 
 ```sh
 BUILD_DIR=build-noaudio EXTRA_CFLAGS="-DPS1_NOAUDIO=1" ./build.sh iso
 ```
+
+### Building on Windows
+
+Install the Windows requirements above, then from the project root, in cmd.exe:
+
+```bat
+set DUKE_GRP=C:\path\DUKE3D.GRP
+build.cmd iso
+```
+
+or in PowerShell:
+
+```powershell
+$env:DUKE_GRP = 'C:\path\DUKE3D.GRP'
+.\build.ps1 iso
+```
+
+The outputs are the same as on Linux, in `build\`. `.\build.ps1` alone builds only the executable
+and `.\build.ps1 clean` removes the build directory. The script uses the Ninja generator
+(`ninja.exe` from `PATH`, otherwise the SDK's `bin`), the SDK at
+`tools\sdk\PSn00bSDK-0.24-win32`, and the toolchain in `tools\gcc` if
+`tools\gcc\bin\mipsel-none-elf-gcc.exe` exists, otherwise the one inside the SDK directory.
+Under PowerShell 7 on Linux or macOS `build.ps1` uses `tools/sdk/PSn00bSDK-0.24-Linux` and the
+default CMake generator, like `build.sh`.
+
+`build.cmd [iso|clean]` is a shim for `powershell -NoProfile -ExecutionPolicy Bypass -File
+build.ps1 <args>` that returns the script's exit code. It is there because the default execution
+policy of Windows PowerShell refuses to run unsigned `.ps1` files; if you call `build.ps1` from a
+PowerShell prompt and get that error, use `build.cmd` or run
+`powershell -NoProfile -ExecutionPolicy Bypass -File build.ps1 iso`.
+
+`build.ps1` reads the same environment variables as `build.sh` (table above) and also takes
+named parameters, which override the environment variable of the same setting:
+
+| Parameter | Environment variable |
+| --- | --- |
+| `-BuildDir` | `BUILD_DIR` |
+| `-Grp` | `DUKE_GRP` |
+| `-Sf2` | `DUKE_SF2` |
+| `-Viewer` | `DUKE_VIEWER` |
+| `-ExtraCFlags` | `EXTRA_CFLAGS` |
+| `-GameOpt` | `DUKE_GAME_OPT` |
+| `-GameKeep` | `DUKE_GAME_KEEP` |
+| `-Python` | `DUKE_PYTHON` |
+
+```powershell
+.\build.ps1 iso -Grp C:\path\DUKE3D.GRP -BuildDir build-noaudio -ExtraCFlags '-DPS1_NOAUDIO=1'
+```
+
+Values are cached per build directory and passed to CMake only when given, as with `build.sh`.
+PowerShell deletes an environment variable that is assigned an empty string, so an empty
+value cannot be expressed through the environment; to clear the cached compiler flags of a build
+directory pass an explicit empty parameter: `.\build.ps1 iso -ExtraCFlags ''`.
+
+From cmd.exe the parameters go through `build.cmd iso -ExtraCFlags "-DPS1_NOAUDIO=1"` (verified
+with PowerShell 7's `-File` mode). Should Windows PowerShell 5.1 report that a parameter named like
+the flag cannot be found, attach the value with a colon, `-ExtraCFlags:"-DPS1_NOAUDIO=1"`, or use the
+environment variable (`set EXTRA_CFLAGS=-DPS1_NOAUDIO=1`) instead.
+
+The RAM budget line `RAM: _end=..., stack reserve N KB` is printed by the `ramcheck` CMake target,
+so it appears on both platforms.
 
 ## Running
 
@@ -168,6 +262,13 @@ Menus and screens:
   - `viewer/viewer_main.c` is the engine viewer used with `DUKE_VIEWER=ON`.
 - `upstream/`: reference source from the 3D Realms release (read-only).
 - `iso.xml`, `system.cnf`: CD image layout and boot configuration.
+- `CMakeLists.txt`: the build for both platforms. `tools/ramcheck.cmake` is the script behind the
+  `ramcheck` target (RAM budget check).
+- `build.sh` (Linux/macOS shell), `build.ps1` (Windows PowerShell 5.1 / PowerShell 7) and
+  `build.cmd` (cmd.exe shim that runs `build.ps1`): configure CMake, build the `ramcheck` target
+  (plus the CD image with `iso`) and read the environment variables described under Building.
+- `.gitattributes`: line endings (`* text=auto`, `*.sh` always LF, `*.cmd` always CRLF) and
+  binary asset types.
 
 ## Testing
 
@@ -177,6 +278,31 @@ Menus and screens:
 python3 tools/emu.py --timeout 300 --exe build/duke3d.exe \
     "wait 1650" "press CROSS 10" "wait 150" "press CROSS 10" "wait 150" "shot menu" "quit"
 ```
+
+On Windows (PowerShell or cmd.exe; use `py` instead of `python` if that is how Python is
+installed):
+
+```bat
+python tools\emu.py --timeout 300 --exe build\duke3d.exe --memcard C:\path\to\card.mcd ^
+    "wait 1650" "press CROSS 10" "wait 150" "press CROSS 10" "wait 150" "shot menu" "quit"
+```
+
+(In PowerShell use a backtick instead of `^` for line continuation, or put the command on one
+line.) `--memcard` is optional; when you use it, give an absolute path.
+
+The emulator is found in this order: `--redux PATH`, the `PCSX_REDUX` environment variable,
+`tools/redux/pcsx-redux.exe` (Windows) or `tools/redux/PCSX-Redux-HEAD-x86_64.AppImage`
+(elsewhere), then `pcsx-redux` on `PATH`. So with the Windows build of PCSX-Redux unpacked
+into `tools/redux/` no option is needed; to use another copy, either
+
+```bat
+python tools\emu.py --redux C:\tools\pcsx-redux\pcsx-redux.exe --exe build\duke3d.exe "wait 1650" "quit"
+```
+
+or `set PCSX_REDUX=C:\tools\pcsx-redux\pcsx-redux.exe` once for the session.
+
+The `mipsel-none-elf-nm` used to read symbols from the `.elf` is looked up in `tools/gcc/bin`,
+then `tools/sdk/PSn00bSDK-0.24-*/bin`, then `PATH`.
 
 Options:
 
@@ -294,7 +420,8 @@ Loading E1L1 takes about 2000 vsyncs.
   stage prints its duration and CD bytes (`LS: stage -> N% took V vsyncs, B CD bytes`), which is what
   the percentages in `game.c`, `premap.c`, `menues.c` and `savegame.c` were derived from.
 - **Memory**: the console has 2 MB of RAM. The SDK heap (`InitHeap` at `_end`, a few KB used by
-  `CdSearchFile`) and the stack share the space above `.bss`. `build.sh` enforces that the end of
+  `CdSearchFile`) and the stack share the space above `.bss`. The `ramcheck` CMake target (run by
+  `build.sh`, `build.ps1` and `build.cmd`) enforces that the end of
   `.bss` (`_end`) stays at or below 0x801F8000, keeping 32 KB for them (it prints
   `RAM: _end=..., stack reserve N KB`; the current build leaves about 56 KB).
 - **Performance**: the 3D view runs Build's column visibility at half horizontal resolution

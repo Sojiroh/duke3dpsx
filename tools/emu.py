@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Headless PCSX-Redux test harness.
 
-Usage: emu.py [--iso build/duke3d.cue | --exe build/duke3d.exe] [--out DIR] [--timeout S]
+Usage (Linux/macOS: python3 tools/emu.py ...; Windows: py tools/emu.py ... or python tools/emu.py ...):
+       emu.py [--redux PATH] [--iso build/duke3d.cue | --exe build/duke3d.exe] [--out DIR] [--timeout S]
               [--memcard FILE] [--watchdog N] [--dynarec] ACTION ...
 Actions (frame-scheduled, executed in order; a frame = one vsync):
   wait N            wait N frames
@@ -13,6 +14,13 @@ Actions (frame-scheduled, executed in order; a frame = one vsync):
   pc N              print the CPU state (EXCEPTION ... (sample) lines, symbolized) every frame for N frames
   prof N            sample the PC every frame for N frames and print a PROFILE histogram (by function and by caller)
   quit              print the final CPU state + FPS and exit emulator
+Emulator lookup: --redux PATH, then $PCSX_REDUX, then tools/redux/pcsx-redux.exe (Windows) or
+tools/redux/PCSX-Redux-HEAD-x86_64.AppImage (elsewhere), then `pcsx-redux` on PATH.  nm lookup:
+tools/gcc/bin, tools/sdk/PSn00bSDK-0.24-*/bin, then PATH (mipsel-none-elf-nm[.exe]).
+Config isolation: PCSX-Redux keeps pcsx.json in $HOME (Linux, getenv("HOME")) or %APPDATA% (Windows, per its
+System::getPersistentDir); the harness points both at <out>/home so the user's own config is neither read
+nor modified.  Not covered: PCSX-Redux's portable mode (a pcsx.json in the *current directory* wins over
+APPDATA); do not run this from a directory containing one.  The Windows path is untested here.
 Prints the game's TTY output.  Symbols (watchdog address, symbolizer, profile) come from the ELF next to
 --exe (duke3d.elf), or from $BUILD_DIR/duke3d.elf when only --iso is used.
 --watchdog N: the game's video_framecount is watched; after 240 frames without a new game frame a WATCHDOG
@@ -23,7 +31,9 @@ Exit code: 0 when the script completed (also at the end of the actions or after 
 CPU exception (crash.png + EXCEPTION line), 4 watchdog, 124 --timeout.
 """
 import argparse
+import glob
 import os
+import shutil
 import subprocess
 import sys
 
@@ -31,13 +41,53 @@ import numpy as np
 from PIL import Image
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-REDUX = os.path.join(ROOT, "tools/redux/PCSX-Redux-HEAD-x86_64.AppImage")
+WIN = os.name == "nt"
 ELF = os.path.join(ROOT, os.environ.get("BUILD_DIR", "build"), "duke3d.elf")  # set from --exe in main()
+
+
+def redux_candidates(cli=None):
+    """Ordered (source, path) candidates for the PCSX-Redux executable."""
+    c = []
+    if cli:
+        c.append(("--redux", cli))
+    if os.environ.get("PCSX_REDUX"):
+        c.append(("$PCSX_REDUX", os.environ["PCSX_REDUX"]))
+    c.append(("default", os.path.join(ROOT, "tools", "redux",
+                                      "pcsx-redux.exe" if WIN else "PCSX-Redux-HEAD-x86_64.AppImage")))
+    return c
+
+
+def find_redux(cli=None):
+    for src, p in redux_candidates(cli):
+        if os.path.isfile(p):
+            return p
+        if src != "default":  # an explicitly requested emulator must exist: no silent fallback
+            break
+    else:
+        on_path = shutil.which("pcsx-redux")
+        if on_path:
+            return on_path
+    lines = ["PCSX-Redux not found; candidates (an explicit --redux or $PCSX_REDUX must exist, otherwise the rest are used in order):"]
+    lines += ["  %s: %s" % (src, p) for src, p in redux_candidates(cli)]
+    lines.append("  PATH: pcsx-redux")
+    lines.append("Pass --redux PATH or set PCSX_REDUX, or put it under tools/redux/.")
+    raise SystemExit("\n".join(lines))
+
+
+def find_nm():
+    exe = "mipsel-none-elf-nm" + (".exe" if WIN else "")
+    dirs = [os.path.join(ROOT, "tools", "gcc", "bin")]
+    dirs += sorted(glob.glob(os.path.join(ROOT, "tools", "sdk", "PSn00bSDK-0.24-*", "bin")))
+    for d in dirs:
+        p = os.path.join(d, exe)
+        if os.path.isfile(p):
+            return p
+    return shutil.which(exe) or os.path.join(dirs[0], exe)  # missing: the run fails with the first candidate
 
 
 def symbol_addr(name):
     elf = ELF
-    nm = os.path.join(ROOT, "tools/gcc/bin/mipsel-none-elf-nm")
+    nm = find_nm()
     for l in subprocess.run([nm, elf], capture_output=True, text=True).stdout.splitlines():
         parts = l.split()
         if len(parts) == 3 and parts[2] == name:
@@ -154,7 +204,7 @@ def symbolize(ln):
         return ln
     import bisect, re
     elf = ELF
-    nm = os.path.join(ROOT, "tools/gcc/bin/mipsel-none-elf-nm")
+    nm = find_nm()
     syms = []
     for l in subprocess.run([nm, "-n", elf], capture_output=True, text=True).stdout.splitlines():
         parts = l.split()
@@ -171,7 +221,7 @@ def symbolize(ln):
 def report_profile(samples):
     import bisect
     elf = ELF
-    nm = os.path.join(ROOT, "tools/gcc/bin/mipsel-none-elf-nm")
+    nm = find_nm()
     syms = []
     for l in subprocess.run([nm, "-n", elf], capture_output=True, text=True).stdout.splitlines():
         parts = l.split()
@@ -227,12 +277,14 @@ def main():
     ap.add_argument("--exe")
     ap.add_argument("--out", default=os.path.join(ROOT, bd, "shots"))
     ap.add_argument("--timeout", type=int, default=300)
+    ap.add_argument("--redux", help="PCSX-Redux executable (default: $PCSX_REDUX, tools/redux/, PATH)")
     ap.add_argument("--memcard")
     ap.add_argument("--dynarec", action="store_true")
     ap.add_argument("--watchdog", type=int, default=60,
                     help="quit (exit 4, hang.png) after N stall samples; the first comes after 240 vsyncs without a game frame, then one per 40 vsyncs")
     ap.add_argument("actions", nargs="*")
     args = ap.parse_args()
+    redux = find_redux(args.redux)
     # the ELF (watchdog symbol, symbolizer, profile) must belong to the executable being run
     ELF = os.path.splitext(os.path.abspath(args.exe))[0] + ".elf" if args.exe else os.path.join(ROOT, bd, "duke3d.elf")
     if not os.path.exists(ELF):
@@ -241,7 +293,7 @@ def main():
     actions = args.actions or ["wait 300", "shot boot", "quit"]
     lua = os.path.join(args.out, "script.lua")
     open(lua, "w").write(gen_lua(actions, args.out, symbol_addr("video_framecount"), args.watchdog))
-    cmd = [REDUX, "-no-ui", "-run", "-fastboot", "-no-update", "-stdout", "-lua_stdout",
+    cmd = [redux, "-no-ui", "-run", "-fastboot", "-no-update", "-stdout", "-lua_stdout",
            "-dofile", lua, "-interpreter" if not args.dynarec else "-dynarec", "-2mb"]
     cmd += ["-iso", args.iso]
     if args.exe:
@@ -249,6 +301,8 @@ def main():
     if args.memcard:
         cmd += ["-memcard1", args.memcard]
     env = dict(os.environ, HOME=os.path.join(args.out, "home"))
+    if WIN:
+        env["APPDATA"] = env["HOME"]  # Windows PCSX-Redux keeps pcsx.json under %APPDATA%
     os.makedirs(env["HOME"], exist_ok=True)
     try:
         p = subprocess.run(cmd, capture_output=True, text=True, timeout=args.timeout, env=env)

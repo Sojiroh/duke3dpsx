@@ -1,0 +1,27 @@
+# Normalise text files; checkouts use the platform's native line endings unless overridden below.
+* text=auto
+
+# Scripts run by their own shells: bash chokes on CR, cmd.exe is happiest with CRLF.
+*.sh  text eol=lf
+*.cmd text eol=crlf
+*.ps1 text
+
+# Copied verbatim into the CD image (the BIOS boot file); keep it byte-identical on every platform.
+system.cnf text eol=lf
+
+# Binary assets / build products (never touch line endings).
+*.grp binary
+*.dat binary
+*.art binary
+*.map binary
+*.voc binary
+*.mid binary
+*.sf2 binary
+*.bin binary
+*.cue binary
+*.exe binary
+*.elf binary
+*.png binary
+*.mcd binary
+*.zip binary
+*.AppImage binary
