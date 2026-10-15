@@ -47,8 +47,10 @@ static void slot_name(char *dst, int slot, int alt)
 /* Let an asynchronous CD read (texture/music streamers) finish before touching the card: both
    use IRQs and the card transfer is timing sensitive.  Nothing starts a new read while we are
    inside mc_* (the game is single threaded and we never call back). */
+extern void fx_quiesce(void);   /* spu_fx.c: sound-effect sample read in flight / queued play requests */
 static void quiesce(void)
 {
+	fx_quiesce();
 	int t = video_vsync_count();
 	while (pak_busy() && video_vsync_count() - t < 180)
 		;

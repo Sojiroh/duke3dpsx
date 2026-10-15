@@ -160,6 +160,7 @@ static void validate_list(void)
 }
 
 unsigned prof_gwait, prof_vwait;   /* ticks (hblank) spent waiting for the GPU / the vblank in video_flip */
+unsigned prof_dbg_ticks;           /* ticks (hblank) spent in dbg() output (psx.h) since game.c's frame profiler last cleared it */
 #endif
 
 void video_flip(void)

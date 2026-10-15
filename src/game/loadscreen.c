@@ -10,6 +10,7 @@
 #include "duke3d.h"
 #include "texcache.h"
 #include "loadscreen.h"
+#include "fx_man.h"
 
 #define BAR_X0 60          /* border box, screen pixels (320x240) */
 #define BAR_X1 259
@@ -87,6 +88,7 @@ void loadscreen_begin(const char *line1, const char *line2, int showpic)
 
     video_wait_gpu();
     tex_quiesce();                    /* no streaming read may start (or use the staging buffer) while the screen is up */
+    fx_quiesce();                     /* ... nor a sound-effect sample read (fx_man.h) */
     if(showpic)
     {
         tex_preload(LOADSCREEN);      /* resident and locked: the redraws below never read the CD */

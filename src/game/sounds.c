@@ -307,42 +307,83 @@ static int sound_register(unsigned short num) { return sound_register2(num, 0); 
 #ifdef PS1_PROF
 static int sfx_preloaded;
 #endif
-/* PS1: level sound preload from SNDGRP (the preload set, contiguous on disc; tools/mkdata.py add_sound_group):
-   one coalesced CD read per ~32 KB instead of one seek per sound. Same budget rule as getsound(); sounds not
-   in the group (or when the group is missing) are still handled by getsound() through the global copies. */
+/* PS1: level sound preload from SNDGRP (tools/mkdata.py add_sound_group).  SNDMAP = nmaps (aux) table entries
+   { char name[16] (map file name, "*" = any other map); u32 first record; u32 record count } followed by the
+   records { u16 sound, u16 0, u32 byte offset in SNDGRP, u32 size } of all maps.  A map's records list the sounds
+   its actors/ambience/player can play first (most important first), then the number-order filler, laid out
+   contiguously in SNDGRP so that one coalesced CD read fetches ~32 KB. */
+#define SNDGRP_MAXREC 192
 extern void *tex_staging(void);
 extern void tex_quiesce(void);
+static int sndmap_name_eq(const char *a, const char *b)
+{
+    for(;;)
+    {
+        char ca = *a++, cb = *b++;
+        if(ca >= 'a' && ca <= 'z') ca -= 32;
+        if(cb >= 'a' && cb <= 'z') cb -= 32;
+        if(ca == '.') ca = 0;   /* the CON names the map without extension, SNDMAP with ".MAP" */
+        if(cb == '.') cb = 0;
+        if(ca != cb) return 0;
+        if(ca == 0) return 1;
+    }
+}
+
 void sound_preload_group(void)
 {
     const PakEntry *gm, *gd;
-    struct { unsigned short num, pad; unsigned int sector, size; } recs[80];
-    fx_sample *list[80];
-    unsigned long rel[80];
-    int i, n = 0, nrec;
+    struct { unsigned short num, pad; unsigned int sector, size; } recs[SNDGRP_MAXREC];
+    fx_sample *list[SNDGRP_MAXREC];
+    unsigned long rel[SNDGRP_MAXREC];
+    const char *mapname;
+    int i, n = 0, nrec, nmaps;
+    unsigned int first = 0, cnt = 0;
     long planned;
+#ifdef PS1_PROF
+    int t0 = video_vsync_count();
+#endif
 
     if (ps1_audio_disabled || SoundToggle == 0 || FXDevice == NumSoundCards) return;
     gm = pak_find("SNDMAP");
     gd = pak_find("SNDGRP");
     if (gm == NULL || gd == NULL) return;
-    nrec = (int)gm->aux;
-    if (nrec > 80 || nrec * (int)sizeof(recs[0]) != (int)gm->size) return;
-    if (pak_read_bytes(gm, 0, recs, gm->size) < 0) return;
+    nmaps = (int)gm->aux;
+    if (nmaps * 24 > (int)sizeof(recs) || nmaps * 24 > (int)gm->size) return;
+    if (pak_read_bytes(gm, 0, recs, nmaps * 24) < 0) return;
+    if (boardfilename[0] != 0 && ud.level_number == 7 && ud.volume_number == 0) mapname = "*";
+    else mapname = level_file_names[ud.volume_number*11 + ud.level_number];
+    for (i = 0; i < 2 && cnt == 0; i++)   /* this map, then the generic group "*" */
+    {
+        const char *t = (const char *)recs;
+        int k;
+        for (k = 0; k < nmaps; k++, t += 24)
+            if (sndmap_name_eq(t, i == 0 ? mapname : "*"))
+            {
+                first = ((const unsigned int *)t)[4];
+                cnt = ((const unsigned int *)t)[5];
+                break;
+            }
+    }
+    nrec = (int)cnt;
+    if (nrec == 0 || nrec > SNDGRP_MAXREC) return;
+    if (pak_read_bytes(gm, nmaps * 24 + first * 12, recs, nrec * 12) < 0) return;
 
-    planned = FX_CacheUsed();
+    planned = 0;
     for (i = 0; i < nrec; i++)
     {
         unsigned short num = recs[i].num;
         long sz;
-        if (num >= NUM_SOUNDS || Sound[num].ptr != 0) continue;
+        if (num >= NUM_SOUNDS) continue;
         if (sound_register2(num, 1) == 0) continue;
         sz = (sfxdesc[num].size + 63) & ~63;
         if (sfxdesc[num].size != recs[i].size) continue;
+        /* the group is budgeted by mkdata.py; samples left over from the previous level count only once
+           they are in this level's list, the others are evicted (LRU) when the room is needed */
         if( (ud.level_number == 0 && ud.volume_number == 0 && (num == 189 || num == 232 || num == 99 || num == 233 || num == 17 ) ) ||
             (planned + sz <= (FX_CacheSize() / 4) * 3) )
         {
             planned += sz;
-            Sound[num].lock = 2;
+            if(Sound[num].lock < 2) Sound[num].lock = 2;
             list[n] = &sfxdesc[num];
             rel[n] = recs[i].sector;
             n++;
@@ -354,8 +395,16 @@ void sound_preload_group(void)
     i = FX_PreloadGroup(list, rel, n, gd->sector, tex_staging(), 65536);
 #ifdef PS1_PROF
     sfx_preloaded += i;
-    dbg("sound group: %d/%d sounds preloaded\n", i, nrec);
+    dbg("sound group %s: %d/%d sounds preloaded in %d vsyncs, %ld KB planned\n", mapname, i, nrec, video_vsync_count() - t0, planned / 1024);
 #endif
+}
+
+/* PS1: gameplay (not the menus / title / bonus screens, which have no 3D frame to stall) loads samples asynchronously */
+static int sfx_async_ctx(void)
+{
+    int on = (ps[myconnectindex].gm & MODE_GAME) && !(ps[myconnectindex].gm & MODE_MENU);
+    FX_SetAsyncLoads(on);
+    return on;
 }
 
 char getsound(unsigned short num)
@@ -386,6 +435,10 @@ char loadsound(unsigned short num)
     /* PS1: original read the VOC into the cache; here the sample goes to SPU RAM */
     if( sound_register(num) == 0 ) return 0;
 
+    /* PS1: during play the sample is only registered: FX_Play* queues it and streams it in without a stall */
+    if( sfx_async_ctx() ) { Sound[num].lock = 200; return 1; }
+
+    if( sfxdesc[num].slot == 0 ) fx_sync_loads++;
     if( FX_LoadSample(&sfxdesc[num]) == 0 ) return 0;   /* PS1: lock only once the sample is resident */
     Sound[num].lock = 200;
     return 1;
@@ -394,6 +447,7 @@ char loadsound(unsigned short num)
 int xyzsound(short num,short i,long x,long y,long z)
 {
     if (ps1_audio_disabled) return -1;
+    sfx_async_ctx();
     long sndist, cx, cy, cz, j,k;
     short pitche,pitchs,cs;
     int voice, sndang, ca, pitch;
@@ -532,6 +586,7 @@ int xyzsound(short num,short i,long x,long y,long z)
 void sound(short num)
 {
     if (ps1_audio_disabled) return;
+    sfx_async_ctx();
     short pitch,pitche,pitchs,cx;
     int voice;
     long start;

@@ -31,7 +31,7 @@ static void stack_report(void)
 	start = ((unsigned)_end + hu.heap + 16 + 3) & ~3u;   /* +16: malloc's end-of-heap marker words */
 	for (p = (volatile u32 *)start; p < end && *p == SP_PAT; p++) ;
 	if ((unsigned)p < lowest) lowest = (unsigned)p;
-	printf("PROF stack: peak use %u B (lowest touched 0x%08x), free above heap %u B (_end=0x%08x, heap+16 = 0x%08x)\n",
+	dbg("PROF stack: peak use %u B (lowest touched 0x%08x), free above heap %u B (_end=0x%08x, heap+16 = 0x%08x)\n",
 	       SP_TOP - lowest, lowest, lowest - start, (unsigned)_end, start);
 }
 

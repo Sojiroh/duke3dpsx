@@ -260,12 +260,19 @@ static void prof_report(void)
 #endif
 static const PakEntry *tiledata;
 
+/* PS1: sprite-class tiles with a half-resolution copy (mkdata: flags 1|2, big world sprites) are always loaded
+   at half resolution: the full-res copy is never read from the CD nor kept in VRAM. */
+#ifndef TEX_SPRITE_HALF
+#define TEX_SPRITE_HALF 1
+#endif
+#define TEX_FORCE_HALF(p) (TEX_SPRITE_HALF && (tileflags[p] & 2))
+
 /* returns 1 if the half-resolution copy was selected */
 static int piece_info(int picnum, int piece, int *xoff, int *yoff, int *w, int *h, u32 *sector)
 {
 	if (tilenpieces[picnum] <= 1) {
 		*xoff = *yoff = 0; *w = tilesizx[picnum]; *h = tilesizy[picnum]; *sector = tilesect[picnum];
-		if ((tileflags[picnum] & 1) && active_texels_now() > VRAM_PRESSURE) {
+		if ((tileflags[picnum] & 1) && (TEX_FORCE_HALF(picnum) || active_texels_now() > VRAM_PRESSURE)) {
 			*w >>= 1; *h >>= 1; *sector = tileaux[picnum];
 			return 1;
 		}
@@ -382,7 +389,7 @@ static int reclaim_stale(int cls)
 
 static s16 alloc_block(int w, int h)
 {
-	int lw = log2ceil(piece_stride(w)), lh = log2ceil(piece_rows(h)), i;
+	int lw = log2ceil(piece_stride(w)), lh = log2ceil(piece_rows(h)), i, stale = 0;
 	for (;;) {
 		for (i = 0; i < NPAGES; i++) {
 			s16 n;
@@ -395,7 +402,9 @@ static s16 alloc_block(int w, int h)
 			s16 n = node_find(roots[i], lw, lh);
 			if (n >= 0) { pclass[i] = 1; return n; }
 		}
-		if (reclaim_stale(2)) continue;
+		/* PS1: the loop only evicts buddy-class tiles after the first pass, which cannot make a shelf page stale: one
+		   reclaim_stale() scan per call (each pass of the loop cost ~20 hblank ticks, a load evicting ~30 tiles ~4 vsyncs) */
+		if (!stale) { stale = 1; if (reclaim_stale(2)) continue; }
 		if (!evict_lru(1)) return -1;
 	}
 }
@@ -409,10 +418,14 @@ static s16 alloc_block(int w, int h)
    free neighbours. When nothing fits, shelf_evict() empties the run of adjacent shelves with the oldest latest use. */
 static int shelf_run(u32 mask, int u)
 {
-	u32 run = (1u << u) - 1;
-	int b;
-	for (b = 0; b + u <= 16; b++) if (!(mask & (run << b))) return b;
-	return -1;
+	/* PS1: bit b of x = columns b..b+u-1 are all free (the whole-shelf scans call this for every shelf; a per-column
+	   loop made a load that evicted many tiles cost ~10 vsyncs) */
+	u32 x = ~mask & 0xffff;
+	int k;
+	for (k = 1; k < u && x; k++) x &= x >> 1;
+	if (!x) return -1;
+	for (k = 0; !(x & 1); k++) x >>= 1;
+	return k;
 }
 
 static void shelf_take(int p, int i, int b, int u, int stride, Slot *sl)
@@ -515,15 +528,17 @@ static void shelf_free(const Slot *sl)
 static int shelf_evict(int H, u32 age)
 {
 	u32 last[NPAGES][MAXSHELF], bl = 0, bt = 0;
-	u8 bad[NPAGES][MAXSHELF];
+	u8 bad[NPAGES][MAXSHELF], yi[NPAGES][64];
 	int s, p, i, j, bp = -1, bi = 0, bj = 0, n = 0;
-	memset(last, 0, sizeof(last)); memset(bad, 0, sizeof(bad));
+	memset(last, 0, sizeof(last)); memset(bad, 0, sizeof(bad)); memset(yi, 0xff, sizeof(yi));
+	/* PS1: shelf index by y/4: a linear search per slot made one call cost several vsyncs (a whole-shelf eviction) */
+	for (p = 0; p < NPAGES; p++) if (pclass[p] == 2) for (i = 0; i < nshelf[p]; i++) yi[p][shelves[p][i].y >> 2] = i;
 	for (s = 0; s < MAXSLOTS; s++) {
 		const Slot *sl = &slots[s];
 		if (!sl->state || sl->node >= 0) continue;
 		p = sl->page;
-		for (i = 0; i < nshelf[p] && shelves[p][i].y != sl->sy; i++) ;
-		if (i == nshelf[p]) continue;
+		i = yi[p][sl->sy >> 2];
+		if (i == 0xff) continue;
 		if (sl->state != 2 || sl->lock || sl->lastuse + age > texframe || (evict_age > 1 && !sl->lastuse)) bad[p][i] = 1;
 		if (sl->lastuse > last[p][i]) last[p][i] = sl->lastuse;
 	}
@@ -574,11 +589,16 @@ static int alloc_shelf(int stride, int rows, Slot *sl)
 {
 	int H = shelf_hclass(rows);
 	u32 age = evict_age > SHELF_AGE ? evict_age : SHELF_AGE;
+	int stale = 0;
 	for (;;) {
 		if (shelf_try(stride, rows, sl)) return 1;
-		if (reclaim_stale(1)) continue;
+		if (!stale) { stale = 1; if (reclaim_stale(1)) continue; }   /* later passes only evict shelf-class tiles: same answer */
 		if (shelf_evict(H, age)) continue;
 		if (shelf_try_tall(stride, rows, sl)) return 1;
+		/* PS1: every shelf holds a tile used within `age` frames: give up the whole run of shelves whose latest use is oldest
+		   (tiles not used this frame) in one scan; evicting the LRU tile one at a time re-ran the slot scans above per tile
+		   (~50 evictions for one tall sprite = ~10 vsyncs of CPU in one frame) */
+		if (evict_age < age && shelf_evict(H, evict_age)) continue;
 #ifdef PS1_PROF
 		prof_shelflru++;
 #endif
@@ -724,24 +744,21 @@ int tex_evictable_pct(void)
 void tex_prefetch_begin(void) { pfn = 0; pf_budget = PF_BUDGET; }
 
 /* PS1: first 3D frame after a level start (tex_quiesce): the level preload stops at a VRAM budget, so tiles right
-   next to the player can still be missing. Load the nearest PF_BOOT wish-list tiles now, in one go (batched by disc
-   position), instead of drawing placeholders for the first seconds; only while the cache has room. */
+   next to the player can still be missing. Request the nearest PF_BOOT wish-list tiles now (the stream pump batches
+   them by disc position), instead of drawing placeholders for the first seconds; only while the cache has room.
+   They are streamed, not read here: a blocking read (seek + transfer) cost the first 3D frame ~15 vsyncs. */
 #define PF_BOOT 16
 #define PF_BOOT_VRAM_PCT 80
 static u8 pf_boot_pending;
 void tex_prefetch_boot(void)
 {
 	short list[PF_BOOT];
-	int i, j, n = 0;
+	int i, n = 0;
 	if (!pf_boot_pending) return;
 	pf_boot_pending = 0;
-	for (i = 0; i < pfn && n < PF_BOOT; i++) {
-		u32 key = tex_sector(pfq[i]);
-		if (tile2slot[pfq[i]] != 0xffff) continue;
-		for (j = n; j > 0 && tex_sector(list[j - 1]) > key; j--) list[j] = list[j - 1];
-		list[j] = pfq[i]; n++;
-	}
-	if (tex_vram_pct() < PF_BOOT_VRAM_PCT) tex_preload_list(list, n);
+	for (i = 0; i < pfn && n < PF_BOOT; i++)
+		if (tile2slot[pfq[i]] == 0xffff) list[n++] = pfq[i];
+	if (tex_vram_pct() < PF_BOOT_VRAM_PCT) for (i = 0; i < n; i++) queue_tile(list[i]);
 	pfn = 0;
 }
 
@@ -974,7 +991,7 @@ static void start_run(int picnum, u16 qfh)
 			if (x < pfn) { t = pfq[x]; lim = end + 16 > TEX_WIN ? TEX_WIN : end + 16; }
 			else { t = t0 + x - pfn; lim = ra; }
 			if (tilesizx[t] <= 0 || tilesizy[t] <= 0 || tilenpieces[t] > 1 || tile2slot[t] != 0xffff) continue;
-			if (piece_info(t, 0, &xo, &yo, &w, &h, &sec) || w <= 0 || h <= 0) continue;
+			if ((piece_info(t, 0, &xo, &yo, &w, &h, &sec) && !TEX_FORCE_HALF(t)) || w <= 0 || h <= 0) continue;
 			secs = (piece_stride(w) * piece_rows(h) + 2047) / 2048;
 			if (sec < lo || (int)(sec - lo) + secs > lim) continue;
 			evict_age = PF_AGE;
@@ -1079,17 +1096,40 @@ static void pump(void)
 			start_run(picnum, qfh);
 			return;
 		}
-		for (p = 0; p < np; p++) {   /* multi-piece: load synchronously (rare, menus) */
-			int stride, h, s;
-			u32 sector;
+		/* PS1: multi-piece tile (bigger than a page): streamed like the others, one read for the missing pieces that follow
+		   each other on the disc (<= TEX_WIN sectors). Blocking reads cost ~10 vsyncs per piece in the middle of a frame. */
+		for (p = 0; p < np; p++) {
+			int stride, h, s, q, secs, total, xo, yo, w, hh;
+			u32 sector, sec2;
 			if (find_slot(picnum, p) >= 0) continue;
 			s = begin_load(picnum, p, &stride, &h, &sector);
 			if (s < 0) return;
+			total = (stride * h + 2047) / 2048;
+			run_slot[0] = s; run_off[0] = 0; nrun = 1;
+			for (q = p + 1; q < np && nrun < MAXRUN; q++) {
+				if (find_slot(picnum, q) >= 0) continue;
+				piece_info(picnum, q, &xo, &yo, &w, &hh, &sec2);
+				secs = (piece_stride(w) * piece_rows(hh) + 2047) / 2048;
+				if (w <= 0 || hh <= 0 || sec2 != sector + total || total + secs > TEX_WIN) break;
+				s = begin_load(picnum, q, &stride, &h, &sec2);
+				if (s < 0) break;
+				run_slot[nrun] = s; run_off[nrun] = total; nrun++;
+				total += secs;
+			}
+			nreq = nrun;
 #ifdef PS1_PROF
+			for (q = 0; q < nrun; q++) run_qf[q] = 0;
 			prof_cmds++;
 #endif
-			if (pak_read(tiledata->sector + sector, (stride * h + 2047) / 2048, staging) < 0) { evict_slot(s); return; }
-			finish_load(s, stride, h);
+			cd_pos = sector + total;
+			cd_done = 0;
+			if (!pak_read_async(tiledata->sector + sector, total, staging, cd_cb)) {
+				for (q = 0; q < nrun; q++) evict_slot(run_slot[q]);
+				nrun = 0;
+				return;
+			}
+			for (q = 0; q < np; q++) if (find_slot(picnum, q) < 0) { queue_add(picnum); break; }
+			return;
 		}
 	}
 }
@@ -1160,7 +1200,7 @@ int tex_lookup_sync(int picnum, int piece, TexRef *out)
 }
 int tex_vram_used(void) { return vram_used; }
 /* CD sector of the (first piece of the) tile, used to sort preloads and avoid seeks. */
-u32 tex_sector(int picnum) { return tilenpieces[picnum] > 1 ? piecetab[tileaux[picnum]].sector : tilesect[picnum]; }
+u32 tex_sector(int picnum) { return tilenpieces[picnum] > 1 ? piecetab[tileaux[picnum]].sector : ((tileflags[picnum] & 1) && TEX_FORCE_HALF(picnum)) ? tileaux[picnum] : tilesect[picnum]; }
 /* Percentage of the cache VRAM that is allocated. */
 int tex_vram_pct(void) { return (int)(vram_used * 100 / VRAM_TEXELS); }
 /* Percentage of the cache VRAM that is in the recent working set (drives the half-res decision). */

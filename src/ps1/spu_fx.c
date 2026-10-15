@@ -18,7 +18,8 @@
 static u32 staging[SPU_STAGING_BYTES / 4] __attribute__((aligned(16)));
 static int hw_inited;
 
-u8 *spu_staging(void) { return (u8 *)staging; }
+static void fx_load_abort(void);
+u8 *spu_staging(void) { fx_load_abort(); return (u8 *)staging; }   /* PS1: the buffer is borrowed: no async sfx read may fill it */
 
 /* Monotonic 120 Hz clock. The game rewinds totalclock (level start, menu close), which
    would leave voices "active" for as long as the clock went back. */
@@ -135,6 +136,7 @@ u32 spu_pitch_reg(u32 rate, u32 scale)
 
 int spu_load_adpcm(u32 sector, u32 bytes, u32 addr, int loop)
 {
+	fx_load_abort();   /* PS1: an async sfx load in flight uses the same staging buffer */
 	u8 *buf = (u8 *)staging;
 	u32 off = 0;
 	while (off < bytes) {
@@ -169,7 +171,7 @@ static int cache_loads, cache_evicts;
 
 /* voices */
 typedef struct {
-	u8 active, looped, prio, slot;
+	u8 active, looped, prio, slot, pidx;   /* pidx: 1 + index of the P[] request this voice plays (0 = none) */
 	u8 l, r;               /* pan levels 0..255 (audiolib left/right) */
 	u32 serial;
 	u32 cb;
@@ -178,8 +180,34 @@ typedef struct {
 } fxvoice;
 static fxvoice V[FX_MAXVOICES];
 
+/* PS1: asynchronous on-demand loads.  A sound that is not resident when it is played is queued in P[] (the
+   caller gets a handle at once and the usual end-of-voice callback later); fx_update() streams the sample into
+   SPU RAM chunk by chunk with pak_read_async (staging -> SPU DMA -> next chunk) and starts the voice when it
+   is resident, or drops the request (callback, as if the voice had ended) once it is older than PEND_MAX_AGE
+   vsyncs.  Handles of queued requests use the voice indices 16..16+NPEND-1, which no real voice has. */
+#define NPEND 8
+#define PEND_MAX_AGE 40
+enum { PS_FREE, PS_WAIT, PS_PLAY };
+typedef struct {
+	u8 state, voice, loop, prio, l, r;
+	int pitchoffset;
+	u32 handle, cb, stamp;
+	fx_sample *s;
+} fxpend;
+static fxpend P[NPEND];
+enum { LD_NEXT, LD_READING, LD_READ_OK, LD_READ_FAIL };
+static fx_sample ld_dummy;           /* owner of the slot reserved by the load in flight */
+static fx_sample *ld_s;              /* sample being loaded (NULL = no load in flight) */
+static volatile u8 ld_state;         /* LD_*; LD_READING until the CD callback (IRQ) reports the chunk */
+static u8 ld_loop;
+static int ld_fi, fx_async;
+static u32 ld_addr, ld_off, ld_n, ld_t0, ld_cb_val;
+static int st_async_loads, st_async_played, st_async_dropped, st_async_failed;
+int fx_sync_loads;                   /* on-demand loads that blocked on the CD (play time, not the level precache) */
+
 static int slot_in_use(int i)
 {
+	if (ld_s && i == ld_fi) return 1;   /* reserved by an async load */
 	for (int v = 0; v < FX_MAXVOICES; v++)
 		if (V[v].active && V[v].slot == i) return 1;
 	return 0;
@@ -337,6 +365,8 @@ void fx_debug(void)
 		if (slots[i].s) { used += slots[i].size; n++; }
 	dbg("fx: cache %d samples, %u/%u bytes, loads %d evicts %d\n", n, (unsigned)used,
 	    (unsigned)(SPU_FX_LIMIT - SPU_FX_BASE), cache_loads, cache_evicts);
+	dbg("PROF sfxq: async loads %d played %d dropped %d failed %d; sync on-demand loads %d\n", st_async_loads,
+	    st_async_played, st_async_dropped, st_async_failed, fx_sync_loads);
 	for (int v = 0; v < FX_MAXVOICES; v++)
 		if (V[v].active)
 			dbg("fx: voice %d ch%d cb=%u prio=%d l=%d r=%d loop=%d pitch=%04x vol=%04x/%04x adsr=%04x/%04x\n", v,
@@ -387,6 +417,13 @@ static fxvoice *voice_of(int handle)
 {
 	if (handle <= 0) return 0;
 	int idx = handle & 31;
+	if (idx >= 16) {   /* handle of a request queued by pend_add(): once its sample was loaded it names the voice that plays it */
+		if (idx - 16 >= NPEND) return 0;
+		fxpend *p = &P[idx - 16];
+		if (p->state != PS_PLAY || p->handle != (u32)handle) return 0;
+		fxvoice *pv = &V[p->voice];
+		return (pv->active && pv->pidx == idx - 15) ? pv : 0;
+	}
 	if (idx >= FX_MAXVOICES) return 0;
 	fxvoice *v = &V[idx];
 	if (!v->active || v->serial != (u32)(handle >> 5)) return 0;
@@ -409,8 +446,25 @@ static void voice_stop(int idx, int docallback)
 	fxvoice *v = &V[idx];
 	if (!v->active) return;
 	v->active = 0;
+	if (v->pidx) { P[v->pidx - 1].state = PS_FREE; v->pidx = 0; }
 	spu_key_off(1u << (SPU_FIRSTFX + idx));
 	if (docallback && fx_callback) fx_callback(v->cb);
+}
+
+/* request dropped without playing: report the end of its "voice" so the game's counters balance */
+static void pend_drop(fxpend *p)
+{
+	u32 cb = p->cb;
+	p->state = PS_FREE;
+	if (fx_callback) fx_callback(cb);
+}
+
+static fxpend *pend_of(int handle)
+{
+	int idx = handle & 31;
+	if (handle <= 0 || idx < 16 || idx - 16 >= NPEND) return 0;
+	fxpend *p = &P[idx - 16];
+	return (p->state == PS_WAIT && p->handle == (u32)handle) ? p : 0;
 }
 
 /* audiolib MV_AllocVoice: free voice, else steal the lowest priority one if priority >= its */
@@ -439,13 +493,8 @@ int FX_VoiceAvailable(int priority)
 	return priority >= V[low].prio;
 }
 
-static int fx_play(fx_sample *s, int pitchoffset, int left, int right, int priority, unsigned long cb, int loop)
+static int voice_start(int idx, fx_sample *s, int pitchoffset, int left, int right, int priority, unsigned long cb)
 {
-	if (!fx_installed || !s || s->magic != FX_SAMPLE_MAGIC) return FX_Warning;
-	if (loop && !s->loop) { fx_free_sample(s); s->loop = 1; }
-	if (!FX_LoadSample(s)) return FX_Warning;
-	int idx = voice_alloc(priority);
-	if (idx < 0) return FX_Warning;
 	fxvoice *v = &V[idx];
 	cslot *c = &slots[s->slot - 1];
 	c->last = fx_clock();
@@ -453,6 +502,7 @@ static int fx_play(fx_sample *s, int pitchoffset, int left, int right, int prior
 	u32 pitch = spu_pitch_reg(s->rate, spu_pitch_scale(pitchoffset));
 	if (++fx_serial > 0x3FFFFF) fx_serial = 1;
 	v->active = 1;
+	v->pidx = 0;
 	v->looped = s->loop;
 	v->prio = (u8)(priority < 0 ? 0 : (priority > 255 ? 255 : priority));
 	v->slot = s->slot - 1;
@@ -481,6 +531,45 @@ static int fx_play(fx_sample *s, int pitchoffset, int left, int right, int prior
 	}
 #endif
 	return (int)((v->serial << 5) | idx);
+}
+
+/* queue a play request for a sample that is not resident */
+static int pend_add(fx_sample *s, int pitchoffset, int left, int right, int priority, unsigned long cb, int loop)
+{
+	int i, f = -1;
+	if (s->size == 0 || ((s->size + 63) & ~63u) > SPU_FX_LIMIT - SPU_FX_BASE) return FX_Warning;
+	for (i = 0; i < NPEND; i++) {
+		if (P[i].state == PS_WAIT && P[i].s == s) return FX_Warning;   /* same sound already waiting: merged into that load */
+		if (P[i].state == PS_FREE && f < 0) f = i;
+	}
+	if (f < 0) return FX_Warning;
+	if (++fx_serial > 0x3FFFFF) fx_serial = 1;
+	fxpend *p = &P[f];
+	p->state = PS_WAIT;
+	p->loop = (u8)loop;
+	p->prio = (u8)(priority < 0 ? 0 : (priority > 255 ? 255 : priority));
+	p->l = (u8)(left < 0 ? 0 : (left > 255 ? 255 : left));
+	p->r = (u8)(right < 0 ? 0 : (right > 255 ? 255 : right));
+	p->pitchoffset = pitchoffset;
+	p->handle = (fx_serial << 5) | (u32)(16 + f);
+	p->cb = cb;
+	p->stamp = (u32)video_vsync_count();
+	p->s = s;
+	return (int)p->handle;
+}
+
+static int fx_play(fx_sample *s, int pitchoffset, int left, int right, int priority, unsigned long cb, int loop)
+{
+	if (!fx_installed || !s || s->magic != FX_SAMPLE_MAGIC) return FX_Warning;
+	if (loop && !s->loop) { fx_free_sample(s); s->loop = 1; }
+	if (!s->slot) {
+		if (fx_async) return pend_add(s, pitchoffset, left, right, priority, cb, loop);
+		fx_sync_loads++;   /* blocks on the CD: only for the menu / title, never during play */
+	}
+	if (!FX_LoadSample(s)) return FX_Warning;
+	int idx = voice_alloc(priority);
+	if (idx < 0) return FX_Warning;
+	return voice_start(idx, s, pitchoffset, left, right, priority, cb);
 }
 
 int FX_PlayVOC(char *ptr, int pitchoffset, int vol, int left, int right, int priority, unsigned long cb)
@@ -534,9 +623,15 @@ int FX_PlayWAV3D(char *ptr, int pitchoffset, int angle, int distance, int priori
 int FX_Pan3D(int handle, int angle, int distance)
 {
 	fxvoice *v = voice_of(handle);
-	if (!v) return FX_Warning;
 	int l, r;
 	pan3d(angle, distance, &l, &r);
+	if (!v) {
+		fxpend *p = pend_of(handle);
+		if (!p) return FX_Warning;
+		p->l = (u8)l;
+		p->r = (u8)r;
+		return FX_Ok;
+	}
 	v->l = (u8)l;
 	v->r = (u8)r;
 	apply_volume(v - V);
@@ -547,9 +642,17 @@ int FX_SetPan(int handle, int vol, int left, int right)
 {
 	(void)vol;
 	fxvoice *v = voice_of(handle);
-	if (!v) return FX_Warning;
-	v->l = (u8)(left < 0 ? 0 : (left > 255 ? 255 : left));
-	v->r = (u8)(right < 0 ? 0 : (right > 255 ? 255 : right));
+	left = left < 0 ? 0 : (left > 255 ? 255 : left);
+	right = right < 0 ? 0 : (right > 255 ? 255 : right);
+	if (!v) {
+		fxpend *p = pend_of(handle);
+		if (!p) return FX_Warning;
+		p->l = (u8)left;
+		p->r = (u8)right;
+		return FX_Ok;
+	}
+	v->l = (u8)left;
+	v->r = (u8)right;
 	apply_volume(v - V);
 	return FX_Ok;
 }
@@ -557,7 +660,12 @@ int FX_SetPan(int handle, int vol, int left, int right)
 int FX_SetPitch(int handle, int pitchoffset)
 {
 	fxvoice *v = voice_of(handle);
-	if (!v) return FX_Warning;
+	if (!v) {
+		fxpend *p = pend_of(handle);
+		if (!p) return FX_Warning;
+		p->pitchoffset = pitchoffset;
+		return FX_Ok;
+	}
 	SPU_CH_FREQ(SPU_FIRSTFX + (v - V)) = (u16)spu_pitch_reg(v->s->rate, spu_pitch_scale(pitchoffset));
 	return FX_Ok;
 }
@@ -573,7 +681,12 @@ int FX_SetFrequency(int handle, int frequency)
 int FX_EndLooping(int handle)
 {
 	fxvoice *v = voice_of(handle);
-	if (!v) return FX_Warning;
+	if (!v) {
+		fxpend *p = pend_of(handle);
+		if (!p) return FX_Warning;
+		pend_drop(p);   /* a looping sound that never started has nothing to end */
+		return FX_Ok;
+	}
 	if (v->looped) {
 		v->looped = 0;
 		spu_key_off(1u << (SPU_FIRSTFX + (v - V)));
@@ -582,7 +695,7 @@ int FX_EndLooping(int handle)
 	return FX_Ok;
 }
 
-int FX_SoundActive(int handle) { return voice_of(handle) != 0; }
+int FX_SoundActive(int handle) { return voice_of(handle) != 0 || pend_of(handle) != 0; }
 
 int FX_SoundsPlaying(void)
 {
@@ -594,7 +707,12 @@ int FX_SoundsPlaying(void)
 int FX_StopSound(int handle)
 {
 	fxvoice *v = voice_of(handle);
-	if (!v) return FX_Warning;
+	if (!v) {
+		fxpend *p = pend_of(handle);
+		if (!p) return FX_Warning;
+		pend_drop(p);
+		return FX_Ok;
+	}
 	voice_stop(v - V, 1);
 	return FX_Ok;
 }
@@ -602,10 +720,129 @@ int FX_StopSound(int handle)
 int FX_StopAllSounds(void)
 {
 	for (int i = 0; i < FX_MAXVOICES; i++) voice_stop(i, 1);
+	for (int i = 0; i < NPEND; i++)
+		if (P[i].state == PS_WAIT) pend_drop(&P[i]);
 	return FX_Ok;
 }
 
-/* main-thread service: report voices that played to their end */
+/* ---- async load state machine (see the comment at P[]) ---- */
+
+/* IRQ context: a chunk read finished */
+static void ld_cb(int ok) { ld_state = ok ? LD_READ_OK : LD_READ_FAIL; }
+
+/* give up the load in flight (waits for its CD read) and free the slot it reserved */
+static void fx_load_abort(void)
+{
+	if (!ld_s) return;
+	while (ld_state == LD_READING) ;   /* bounded: pak_tick() cancels a read that does not complete */
+	slots[ld_fi].s = 0;
+	ld_s = 0;
+}
+
+/* loading screen / memory card: no sfx read may be in flight or start, queued requests are dropped */
+void fx_quiesce(void)
+{
+	fx_load_abort();
+	for (int i = 0; i < NPEND; i++)
+		if (P[i].state == PS_WAIT) pend_drop(&P[i]);
+}
+
+void FX_SetAsyncLoads(int on) { fx_async = on; }
+
+static void ld_drop_requests(fx_sample *s)
+{
+	for (int i = 0; i < NPEND; i++)
+		if (P[i].state == PS_WAIT && P[i].s == s) { st_async_dropped++; pend_drop(&P[i]); }
+}
+
+static void pend_step(void)
+{
+	u32 now = (u32)video_vsync_count();
+	int i;
+
+	for (i = 0; i < NPEND; i++)
+		if (P[i].state == PS_WAIT && now - P[i].stamp > PEND_MAX_AGE) { st_async_dropped++; pend_drop(&P[i]); }
+
+	if (ld_s && ld_state == LD_READ_FAIL) {
+		st_async_failed++;
+		ld_drop_requests(ld_s);
+		fx_load_abort();
+	} else if (ld_s && ld_state == LD_READ_OK) {
+		u8 *buf = (u8 *)staging;
+		u32 size = ld_s->size;
+		if (ld_loop) {   /* loop flags as in spu_load_adpcm() */
+			u32 last = size - 32;
+			if (ld_off == 0) buf[1] |= 0x04;
+			if (last >= ld_off && last < ld_off + ld_n) buf[last - ld_off + 1] |= 0x03;
+		}
+		spu_dma_write(ld_addr + ld_off, buf, (ld_n + 63) & ~63u);
+		ld_off += ld_n;
+		if (ld_off < size) ld_state = LD_NEXT;
+		else {
+			fx_sample *s = ld_s;
+			ld_s = 0;
+			if (s->loop != ld_loop || s->slot) slots[ld_fi].s = 0;   /* loop flag changed meanwhile: reload */
+			else {
+				slot_commit(ld_fi, ld_addr, slots[ld_fi].size, s);
+				st_async_loads++;
+#ifdef PS1_PROF
+				dbg("fx: async load sound %u sector %u size %u done after %u vsyncs\n", (unsigned)ld_cb_val, (unsigned)s->sector, (unsigned)size,
+				    (unsigned)((u32)video_vsync_count() - ld_t0));
+#endif
+			}
+		}
+	}
+
+	/* resident now: start the voices */
+	for (i = 0; i < NPEND; i++) {
+		fxpend *p = &P[i];
+		if (p->state != PS_WAIT || !p->s->slot) continue;
+		int idx = voice_alloc(p->prio);
+		if (idx < 0) { st_async_dropped++; pend_drop(p); continue; }
+		voice_start(idx, p->s, p->pitchoffset, p->l, p->r, p->prio, p->cb);
+		V[idx].pidx = (u8)(i + 1);
+		p->state = PS_PLAY;
+		p->voice = (u8)idx;
+		st_async_played++;
+	}
+
+	if (!ld_s) {   /* next load: the oldest request */
+		fxpend *o = 0;
+		for (i = 0; i < NPEND; i++)
+			if (P[i].state == PS_WAIT && (!o || (int)(o->stamp - P[i].stamp) > 0)) o = &P[i];
+		if (o) {
+			fx_sample *s = o->s;
+			u32 size = (s->size + 63) & ~63u, addr;
+			int fi = slot_alloc(size, &addr);
+			if (fi < 0) ld_drop_requests(s);
+			else {
+				slots[fi].addr = addr;
+				slots[fi].size = size;
+				slots[fi].s = &ld_dummy;
+				slots[fi].last = fx_clock();
+				ld_s = s;
+				ld_fi = fi;
+				ld_addr = addr;
+				ld_off = 0;
+				ld_loop = s->loop;
+				ld_state = LD_NEXT;
+				ld_t0 = (u32)video_vsync_count();
+				ld_cb_val = o->cb;
+			}
+		}
+	}
+
+	if (ld_s && ld_state == LD_NEXT && !pak_busy()) {
+		u32 left = ld_s->size - ld_off;
+		u32 nsec = (left + 2047) / 2048;
+		if (nsec > SPU_STAGING_BYTES / 2048) nsec = SPU_STAGING_BYTES / 2048;
+		ld_n = left < nsec * 2048 ? left : nsec * 2048;
+		ld_state = LD_READING;
+		if (!pak_read_async(ld_s->sector + ld_off / 2048, (int)nsec, staging, ld_cb)) ld_state = LD_NEXT;
+	}
+}
+
+/* main-thread service: report voices that played to their end, advance the async loads */
 void fx_update(void)
 {
 	long now = fx_clock();
@@ -613,6 +850,7 @@ void fx_update(void)
 		fxvoice *v = &V[i];
 		if (v->active && !v->looped && now - v->end >= 0) voice_stop(i, 1);
 	}
+	if (fx_installed) pend_step();
 }
 
 void FX_SetVolume(int volume)
@@ -709,7 +947,9 @@ int FX_Init(int SoundCard, int numvoices, int numchannels, int samplebits, unsig
 	(void)SoundCard; (void)numvoices; (void)numchannels; (void)samplebits; (void)mixrate;
 	spu_hw_init();
 	calc_pan_table();
+	fx_load_abort();
 	memset(V, 0, sizeof(V));
+	memset(P, 0, sizeof(P));
 	memset(slots, 0, sizeof(slots));
 	fx_installed = 1;
 	FX_SetReverb(0);

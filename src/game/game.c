@@ -95,17 +95,35 @@ extern unsigned prof_drawalls, prof_scan, prof_most, prof_bunch, prof_prep, prof
                 prof_wall, prof_plane, prof_nwall, prof_nplane, prof_nquad;
 #define PF_FRAMES 120
 static unsigned pf_t, pf_acc[5], pf_n, pf_v0;
+/* longest loop iteration of the window (vsyncs, without the time spent in dbg() output) and the phase that took longest in it */
+extern unsigned prof_dbg_ticks;
+static unsigned pf_ph[5], pf_fmax, pf_fph;
+static int pf_last = -1;
+static void pf_frame(void)
+{
+    int now = video_vsync_count();
+    if (pf_last >= 0)
+    {
+        unsigned t = (unsigned)(now - pf_last) * 262, i, f, b = 0;   /* 262 hblank ticks per vsync */
+        f = t > prof_dbg_ticks ? (t - prof_dbg_ticks) / 262 : 0;
+        for (i = 1; i < 5; i++) if (pf_ph[i] > pf_ph[b]) b = i;
+        if (f > pf_fmax) { pf_fmax = f; pf_fph = b; }
+    }
+    memset(pf_ph, 0, sizeof(pf_ph)); prof_dbg_ticks = 0;
+    pf_last = video_vsync_count();
+}
+#define PF_SKIP() (pf_last = -1)   /* a level load is not a frame */
 static unsigned pf_t2, pf_sub[8];
 #define PFS_MARK() (pf_t2 = prof_now())
 #define PFS_LAP(k) do { unsigned _n = prof_now(); pf_sub[k] += (_n - pf_t2) & 0xffff; pf_t2 = _n; } while(0)
 #ifdef PS1_PROFJ
 /* spin a random fraction of a vsync at the frame start so that vsync-driven PC sampling is not phase-locked */
 static void pf_jitter(void) { unsigned x = prof_now(), d = (unsigned)(rand() % 262); while(((prof_now()-x)&0xffff) < d); }
-#define PF_MARK() (pf_jitter(), pf_n == 0 ? (void)(pf_v0 = video_vsync_count()) : (void)0, pf_t = prof_now())
+#define PF_MARK() (pf_frame(), pf_jitter(), pf_n == 0 ? (void)(pf_v0 = video_vsync_count()) : (void)0, pf_t = prof_now())
 #else
-#define PF_MARK() (pf_n == 0 ? (void)(pf_v0 = video_vsync_count()) : (void)0, pf_t = prof_now())
+#define PF_MARK() (pf_frame(), pf_n == 0 ? (void)(pf_v0 = video_vsync_count()) : (void)0, pf_t = prof_now())
 #endif
-#define PF_LAP(k) do { unsigned _n = prof_now(); pf_acc[k] += (_n - pf_t) & 0xffff; pf_t = _n; } while(0)
+#define PF_LAP(k) do { unsigned _n = prof_now(); pf_acc[k] += (_n - pf_t) & 0xffff; pf_ph[k] += (_n - pf_t) & 0xffff; pf_t = _n; } while(0)
 static void PF_REPORT(void)
 {
     /* MAXSPRITES headroom: peak number of live sprites, reported every 300 frames (this runs after
@@ -134,6 +152,8 @@ static void PF_REPORT(void)
     memset(pf_sub,0,sizeof(pf_sub));
     dbg("PROF counts/frame: wall cols %u strips %u | plane cols %u strips %u verts %u | sprites %u cols %u\n", pc_wcols/PF_FRAMES, pc_wstrips/PF_FRAMES, pc_pcols/PF_FRAMES, pc_pstrips/PF_FRAMES, pc_pverts/PF_FRAMES, pc_spr/PF_FRAMES, pc_sprcols/PF_FRAMES);
     pc_wcols = pc_wstrips = pc_pcols = pc_pstrips = pc_pverts = pc_spr = pc_sprcols = 0;
+    dbg("PROF frame max %u vsyncs (phase %s)\n", pf_fmax, pf_fph == 0 ? "input+move" : pf_fph == 1 ? "logic-end" : pf_fph == 2 ? "rooms" : pf_fph == 3 ? "rest" : "nextpage");
+    pf_fmax = 0;
     dbg("PROF primbuf: max list bytes %d of 57344, dropped prims %d\n", pf_maxbytes, video_dropped_prims);
     pf_maxbytes = 0; video_dropped_prims = 0;
     dbg("PROF waits/frame: gpu %u vblank %u\n", prof_gwait/PF_FRAMES, prof_vwait/PF_FRAMES);
@@ -146,6 +166,7 @@ static void PF_REPORT(void)
 }
 #else
 #define PF_MARK()
+#define PF_SKIP()
 #define PFS_MARK()
 #define PFS_LAP(k)
 #define PF_LAP(k)
@@ -6405,6 +6426,7 @@ int duke_main(void)
 
             ready2send = 0;
             if(numplayers > 1) ps[myconnectindex].gm = MODE_GAME;
+            PF_SKIP();
             enterlevel(ps[myconnectindex].gm);
             continue;
         }

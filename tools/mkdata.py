@@ -146,6 +146,11 @@ def downscale_half(img, pal, nearest):
     return idx.astype(np.uint8)
 
 
+# PS1: tiles the game draws 1:1 on screen (rotatesprite: HUD, fonts, weapons, menus, screens), kept full resolution
+# (tile numbers of names.h: 20..61 HUD icons/pickups, STATIC, 2440..2629 menus/HUD/weapons, 2813..3399 fonts/screens, 4090..4099 camera)
+SPRITE_FULLRES = ((20, 61), (351, 351), (2440, 2629), (2813, 3399), (4090, 4099))
+
+
 def build_tiles(tiles, pal, halfres=()):
     """Return (tileidx bytes, pieces list, tiledata bytes).
     TILEREC (16 bytes): u16 sizx, u16 sizy, s32 picanm, u16 sector (piece 0, relative to TILEDATA),
@@ -159,7 +164,7 @@ def build_tiles(tiles, pal, halfres=()):
     data = bytearray()
     tilepix = {}  # PS1: single-piece tile -> (full-res pixels, half-res pixels or None), for the level groups
     nearest = nearest_index_table(pal) if halfres else None
-    nhalf = 0
+    nhalf = nsprhalf = sprhalfbytes = 0
     # PS1: flags bit 1 = sprite-class tile (shelf-allocated in VRAM, never repeated as a texture): everything that is
     # not a wall/floor texture, nor an animation frame of one (frames follow/precede the tile that the map references)
     wallish = set(halfres)
@@ -194,7 +199,7 @@ def build_tiles(tiles, pal, halfres=()):
         for py in range(0, t.sizy, MAXPIECE):
             for px in range(0, t.sizx, MAXPIECE):
                 tile_pieces.append(add_piece(n, px, py, img[py : py + MAXPIECE, px : px + MAXPIECE]))
-        flags, aux = 0, 0
+        flags, aux, halfonly = 0, 0, False
         hpix = None
         if len(tile_pieces) > 1:
             aux = len(pieces)
@@ -204,13 +209,20 @@ def build_tiles(tiles, pal, halfres=()):
             flags, aux = 1, hp.sector
             nhalf += 1
             hpix = hp.pixels
+        elif n not in wallish and max(t.sizx, t.sizy) >= 48 and not any(a <= n <= b for a, b in SPRITE_FULLRES):
+            # PS1: big world sprites (monsters, items, explosions) are always loaded at half resolution (flags 1|2)
+            hp = add_piece(n, 0, 0, downscale_half(img, pal, nearest))
+            flags, aux, halfonly = 1, hp.sector, True
+            nsprhalf += 1
+            hpix = hp.pixels
+            sprhalfbytes += len(hp.pixels)
         if len(tile_pieces) == 1:
-            tilepix[n] = (tile_pieces[0].pixels, hpix)
+            tilepix[n] = (tile_pieces[0].pixels, hpix, halfonly)
             if n not in wallish:
                 flags |= 2   # sprite class: the runtime packs it with the shelf allocator (no texture window / wrapping)
         recs += struct.pack("<HHiHHHH", t.sizx, t.sizy, t.picanm, tile_pieces[0].sector,
                             avg_color15(img, pal), len(tile_pieces) | (flags << 8), aux)
-    print("tiles with a half-resolution copy: %d" % nhalf)
+    print("tiles with a half-resolution copy: %d (+%d always-half sprites, %d KB)" % (nhalf, nsprhalf, sprhalfbytes // 1024))
     return bytes(recs), pieces, data, tilepix
 
 
@@ -345,10 +357,14 @@ def build_groups(g, tiles, tilepix, data, pack, N):
         first = len(data) // SECTOR
         sect, half = {}, {}
         for t in ts:
+            if tilepix[t][2]:   # PS1: always-half sprite: the half copy takes the full-res slot of the group (full-res is never read)
+                sect[t] = half[t] = len(data) // SECTOR
+                data.extend(tilepix[t][1]); data.extend(b"\0" * (align(len(data)) - len(data)))
+                continue
             sect[t] = len(data) // SECTOR
             data.extend(tilepix[t][0]); data.extend(b"\0" * (align(len(data)) - len(data)))
         for t in ts:
-            if tilepix[t][1] is not None:
+            if tilepix[t][1] is not None and not tilepix[t][2]:
                 half[t] = len(data) // SECTOR
                 data.extend(tilepix[t][1]); data.extend(b"\0" * (align(len(data)) - len(data)))
         assert len(data) // SECTOR < 65536, "TILEDATA with groups exceeds u16 sectors"
@@ -496,49 +512,176 @@ def add_sounds(g, pack):
     return blobs
 
 
-def add_sound_group(g, pack, blobs):
-    """PS1: level sound preload group.  precachenecessarysounds() preloads sounds in number order until 75% of
-    the SPU sample cache is used (plus a few E1L1 menu sounds), the same set for every map, so one group serves
-    all maps.  SNDGRP = the ADPCM blobs (same bytes as the global copies) back to back, 16-byte aligned, in
-    sound-number order (no per-sound sector padding: the CD time is per sector read); SNDMAP = records (u16
-    soundnum, u16 0, u32 byte offset in SNDGRP, u32 size), aux = record count."""
-    defs = {}
-    for cname in ("DEFS.CON", "GAME.CON", "USER.CON"):
+def con_sound_tables(g):
+    """PS1: what the CON scripts say about sounds.  Returns (defs, sounds, actor_sounds): defs = {label: number}
+    of every `define`; sounds = {number: (VOC name, definesound flags)}; actor_sounds = {tile: set of sound numbers}
+    that actor `tile` can play: the `sound` / `globalsound` / `soundonce` labels of its `actor` / `useractor` block
+    and, transitively, of every `state` it calls and every actor it clones (`cactor`) or creates (`spawn` / `shoot` /
+    `eshoot`).  `ifsound` / `stopsound` are not collected (they never need the sample)."""
+    txt = ""
+    for cname in ("DEFS.CON", "USER.CON", "GAME.CON"):
         if cname in g.entries:
-            for m in re.finditer(r"^\s*define\s+(\w+)\s+(-?\d+)", g.read(cname).decode("latin1"), re.M):
-                defs[m.group(1)] = int(m.group(2))
-    numname = {}
-    for cname in ("USER.CON", "GAME.CON", "DEFS.CON"):
-        if cname not in g.entries:
-            continue
-        for m in re.finditer(r"^\s*definesound\s+(\w+)\s+(\S+)", g.read(cname).decode("latin1"), re.M):
-            if m.group(1) in defs:
-                numname[defs[m.group(1)]] = m.group(2).upper()
-    cache = 0x7D940 - 0x2A000  # spu_priv.h SPU_FX_BASE..SPU_FX_LIMIT
-    special = (17, 99, 189, 232, 233)  # getsound(): always preloaded on E1L1
-    chosen, used = [], 0
-    for num in sorted(numname):
-        if numname[num] not in blobs:
-            continue
-        sz = (len(blobs[numname[num]]) + 63) & ~63
-        if used + sz <= cache // 4 * 3:
-            chosen.append(num)
-            used += sz
-    for num in special:
-        if num in numname and numname[num] in blobs and num not in chosen:
-            chosen.append(num)
-    chosen.sort()
-    assert len(chosen) <= 80, len(chosen)
-    grp = bytearray()
-    recs = bytearray()
-    for num in chosen:
-        blob = blobs[numname[num]]
-        recs += struct.pack("<HHII", num, 0, len(grp), len(blob))
-        assert len(blob) % 16 == 0
-        grp += blob
+            t = g.read(cname).decode("latin1")
+            t = re.sub(r"/\*.*?\*/", " ", t, flags=re.S)
+            txt += re.sub(r"//[^\n]*", " ", t) + "\n"
+    defs = {m.group(1): int(m.group(2)) for m in re.finditer(r"^\s*define\s+(\w+)\s+(-?\d+)", txt, re.M)}
+    sounds = {}
+    for m in re.finditer(r"^\s*definesound\s+(\w+)\s+(\S+)\s+-?\d+\s+-?\d+\s+-?\d+\s+(-?\d+)", txt, re.M):
+        if m.group(1) in defs:
+            sounds[defs[m.group(1)]] = (m.group(2).upper(), int(m.group(3)))
+
+    def val(tok):
+        return int(tok) if re.fullmatch(r"-?\d+", tok) else defs.get(tok)
+
+    tok = re.findall(r"[^\s{}]+", txt)
+    states, actors = {}, {}   # name / tile -> [sound numbers, called states, referenced tiles]
+    body = None
+    i = 0
+    while i < len(tok):
+        t = tok[i]
+        if body is None:
+            if t == "state" and i + 1 < len(tok):
+                body = states.setdefault(tok[i + 1], [set(), set(), set()])
+                i += 2
+                continue
+            if t in ("actor", "useractor") and i + 2 < len(tok):
+                tile = val(tok[i + 1 if t == "actor" else i + 2])
+                body = actors.setdefault(tile, [set(), set(), set()])
+                i += 2
+                continue
+        else:
+            if t in ("ends", "enda"):
+                body = None
+            elif t in ("sound", "globalsound", "soundonce") and i + 1 < len(tok):
+                n = val(tok[i + 1])
+                if n in sounds:
+                    body[0].add(n)
+            elif t == "state" and i + 1 < len(tok):
+                body[1].add(tok[i + 1])
+            elif t in ("spawn", "shoot", "eshoot", "cactor") and i + 1 < len(tok):
+                body[2].add(val(tok[i + 1]))
+        i += 1
+
+    actor_sounds = {}
+    for tile in actors:
+        snd, seen_s, seen_a, todo = set(), set(), set(), [("a", tile)]
+        while todo:
+            kind, key = todo.pop()
+            seen, table = (seen_a, actors) if kind == "a" else (seen_s, states)
+            if key in seen or key not in table:
+                continue
+            seen.add(key)
+            snd |= table[key][0]
+            todo += [("s", s) for s in table[key][1]] + [("a", a) for a in table[key][2]]
+        actor_sounds[tile] = snd
+    return defs, sounds, actor_sounds
+
+
+def c_sound_names(path, names):
+    """Sound numbers named by constant in the spritesound/xyzsound/sound/stopsound calls of a game C file."""
+    src = re.sub(r"/\*.*?\*/", " ", open(path, errors="replace").read(), flags=re.S)
+    return {names[m] for m in re.findall(r"\b(?:spritesound|xyzsound|sound|stopsound)\(\s*([A-Z][A-Z_0-9]+)", src) if m in names}
+
+
+def recog_sounds(path, names, N):
+    """{tile: sound numbers} of game.c check_fta_sounds(): the sound an enemy plays when it first sees the player."""
+    src = open(path, errors="replace").read()
+    m = re.search(r"void check_fta_sounds\(short i\)\s*\{(.*?)\n\}", src, re.S)
+    out, cases, reset = {}, [], False
+    for line in (m.group(1).splitlines() if m else []):
+        c = re.match(r"\s*case\s+(\w+)\s*:", line)
+        if c:
+            if reset:
+                cases, reset = [], False
+            cases.append(N.get(c.group(1)))
+        for s in re.findall(r"\b(?:spritesound|sound)\(\s*([A-Z][A-Z_0-9]+)", line):
+            if s in names:
+                for t in cases:
+                    out.setdefault(t, set()).add(names[s])
+        if re.search(r"\bbreak\s*;", line):
+            reset = True
+    return out
+
+
+def add_sound_group(g, pack, blobs):
+    """PS1: per-level sound preload groups.  precachenecessarysounds() preloads a group before the level starts
+    (and nothing else is loaded synchronously during play: sounds.c queues the rest asynchronously).  Per map the
+    group lists, until 75% of the SPU sample cache (spu_priv.h SPU_FX_BASE..LIMIT) is used, the sounds the level
+    can play, most important first (within a tier smaller samples first, so more sounds fit):
+      0. src/game/player.c (weapons, movement, pickups, ...; constant names in its sound calls), plus the
+         E1L1 menu sounds that getsound() always loads there;
+      1. map actors: for every sprite picnum of the map, its CON actor block + called states (con_sound_tables),
+         and the check_fta_sounds() recognition sound of game.c for that picnum;
+      2. ambience: MUSICANDSFX sprites' lotag (and lotag..lotag+hitag for definesound flag 16) of the map;
+      3. generic: the APLAYER actor block (pain/death/jibs), src/game/sector.c and actors.c constants;
+    then the remaining sounds in number order (the old behaviour).  "*" is the group for any other map
+    (tiers 0 and 3 + filler).  SNDGRP = all groups back to back (each starts on a sector boundary, blobs 16-byte
+    aligned, same bytes as the global copies); SNDMAP (aux = map count) = table { char name[16]; u32 first record;
+    u32 record count } per map, then the records { u16 soundnum, u16 0, u32 byte offset in SNDGRP, u32 size }."""
+    root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "src", "game")
+    N = load_names(os.path.join(root, "names.h"))
+    snames = load_names(os.path.join(root, "soundefs.h"))
+    defs, sounds, actor_sounds = con_sound_tables(g)
+    avail = {n for n, (voc, _) in sounds.items() if voc in blobs}
+    size = {n: (len(blobs[sounds[n][0]]) + 63) & ~63 for n in avail}
+    budget = (0x7D940 - 0x2A000) // 4 * 3   # spu_priv.h SPU_FX_BASE..SPU_FX_LIMIT, sounds.c: 3/4 of the cache
+    special = (17, 99, 189, 232, 233)       # getsound(): always preloaded on E1L1 (beyond the budget)
+    maxrec = 192                            # sounds.c SNDGRP_MAXREC
+    c_player = c_sound_names(os.path.join(root, "player.c"), snames) & avail
+    c_generic = (c_sound_names(os.path.join(root, "sector.c"), snames) |
+                 c_sound_names(os.path.join(root, "actors.c"), snames)) & avail
+    c_generic |= actor_sounds.get(N["APLAYER"], set()) & avail
+    recog = recog_sounds(os.path.join(root, "game.c"), snames, N)
+
+    def make_group(mapname, board):
+        tiers = [set(c_player)]
+        if mapname == "E1L1.MAP":
+            tiers[0] |= set(special) & avail
+        act, amb = set(), set()
+        if board is not None:
+            for tile in {sp[4] for sp in board.sprites}:
+                act |= actor_sounds.get(tile, set()) | recog.get(tile, set())
+            for sp in board.sprites:
+                if sp[4] == N["MUSICANDSFX"] and sp[20] < 999:
+                    rng = range(sp[20], sp[20] + sp[21] + 1) if sp[20] in sounds and sounds[sp[20]][1] & 16 else (sp[20],)
+                    amb.update(rng)
+        tiers += [act & avail, amb & avail, set(c_generic)]
+        chosen, used = [], 0
+        for tier in tiers:
+            for n in sorted(tier, key=lambda n: (size[n], n)):
+                if n not in chosen and used + size[n] <= budget and len(chosen) < maxrec - len(special):
+                    chosen.append(n)
+                    used += size[n]
+        for n in sorted(avail):   # filler, number order
+            if n not in chosen and used + size[n] <= budget and len(chosen) < maxrec - len(special):
+                chosen.append(n)
+                used += size[n]
+        if mapname == "E1L1.MAP":
+            chosen += [n for n in special if n in avail and n not in chosen]
+        return chosen, used
+
+    groups = [(name, G.parse_map(g.read(name))) for name in g.names(".MAP")] + [("*", None)]
+    assert len(groups) * 24 <= maxrec * 12, len(groups)
+    grp, table, recs = bytearray(), bytearray(), bytearray()
+    nrec = 0
+    fits = []
+    for mapname, board in groups:
+        chosen, used = make_group(mapname, board)
+        grp.extend(b"\0" * (align(len(grp)) - len(grp)))
+        first = nrec
+        for n in chosen:
+            blob = blobs[sounds[n][0]]
+            assert len(blob) % 16 == 0
+            recs += struct.pack("<HHII", n, 0, len(grp), len(blob))
+            grp += blob
+            nrec += 1
+        table += struct.pack("<16sII", mapname.encode(), first, len(chosen))
+        fits.append((mapname, len(chosen), used // 1024))
     pack.add("SNDGRP", grp)
-    pack.add("SNDMAP", recs, len(chosen))
-    print("sound group: %d sounds, %.0f KB" % (len(chosen), len(grp) / 1024))
+    pack.add("SNDMAP", bytes(table) + bytes(recs), len(groups))
+    print("sound groups: %d maps, %.1f MB; sounds per group %d..%d, %s KB used of %d KB" %
+          (len(groups), len(grp) / 1e6, min(f[1] for f in fits), max(f[1] for f in fits),
+           "/".join(str(f[2]) for f in fits[:1] + fits[-1:]), budget // 1024))
 
 
 def add_music(g, pack, sf2=None):

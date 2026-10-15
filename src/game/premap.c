@@ -92,7 +92,7 @@ void precachenecessarysounds(void)
 
     if (FXDevice == NumSoundCards) return;
     j = 0;
-    sound_preload_group();   /* PS1: coalesced CD reads from the SNDGRP preload group; the loop below takes the rest */
+    sound_preload_group();   /* PS1: coalesced CD reads of this level's sound group (what the level can play, most important first); the loop below fills the budget in number order */
 
     for(i=0;i<NUM_SOUNDS;i++)
         if(Sound[i].ptr == 0)

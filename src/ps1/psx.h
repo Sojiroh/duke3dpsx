@@ -88,7 +88,14 @@ extern volatile long totalclock;    /* 120 Hz tick counter (Build TICRATE) */
 
 /* ---- misc ---- */
 void fatal(const char *fmt, ...) __attribute__((noreturn));
+#ifdef PS1_PROF
+/* PS1: console output is slow in the emulator (~2 vsyncs per PROF line): the time spent in dbg() is kept apart so that the
+   frame profiler (game.c) can leave it out of the frame times */
+extern unsigned prof_dbg_ticks;
+#define dbg(...) do { unsigned _t0 = TIMER_VALUE(1) & 0xffff; printf(__VA_ARGS__); prof_dbg_ticks += ((TIMER_VALUE(1) & 0xffff) - _t0) & 0xffff; } while (0)
+#else
 #define dbg printf
+#endif
 
 /* ---- profiling (hblank counter, ~63.5us per tick NTSC) ---- */
 #include <hwregs_c.h>

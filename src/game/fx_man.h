@@ -86,6 +86,15 @@ int  FX_CacheUsed( void );
 int  FX_CacheSize( void );
 /* Service finished voices (invokes the callback); called from audio_update(). */
 void fx_update( void );
+/* PS1: on-demand loads.  With FX_SetAsyncLoads(1) a FX_Play* call for a sample that is not resident does not
+   block on the CD: it returns a handle at once, the sample is streamed in from fx_update() and the voice starts
+   when it is resident (or the request is dropped after ~40 vsyncs, reported like a voice that ended).  With 0
+   (menus, title) such a call loads the sample synchronously. */
+void FX_SetAsyncLoads( int on );
+/* PS1: finish the async sample read in flight and drop the queued play requests (loading screen, memory card). */
+void fx_quiesce( void );
+/* PS1 profiling: number of play-time loads that blocked on the CD. */
+extern int fx_sync_loads;
 
 char *FX_ErrorString( int ErrorNumber );
 int   FX_SetupCard( int SoundCard, fx_device *device );
